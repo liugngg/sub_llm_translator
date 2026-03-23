@@ -5,7 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
-.config.yaml
+config.yaml
 
 # Virtual environments
 .venv
