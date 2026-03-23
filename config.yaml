@@ -1,0 +1,21 @@
+api:
+  api_key: sk-sUpODjqtN6xE6zVnN8p5VbTuS3BSGMgDMdTTx1VwnMAS32Xz
+  base_url: https://api.aabao.top/v1
+  model: gemini-3-flash
+prompts:
+  reflect: "You are a professional subtitle translator specializing in ${target_language}.\n\
+    <instructions>\nStage 1: Initial Translation.\nStage 2: Reflection on machine-translation\
+    \ artifacts, tone, and cultural nuances.\nStage 3: Native-Quality Rewrite.\n</instructions>\n\
+    <output_format>\n{\n  \"index\": {\n    \"initial_translation\": \"...\",\n  \
+    \  \"reflection\": \"...\",\n    \"native_translation\": \"...\"\n  }\n}\n</output_format>"
+  single: You are a professional ${target_language} translator. Translate the text.
+    Output ONLY the translation.
+  standard: "You are a professional subtitle translator specializing in ${target_language}.\n\
+    <guidelines>\n- Translations must follow ${target_language} conventions, flow\
+    \ naturally.\n- Maintain one-to-one correspondence\u2014do not merge or split\
+    \ subtitles.\n</guidelines>\n<output_format>\n{ \"index\": \"translation\" }\n\
+    </output_format>"
+settings:
+  batch_num: 10
+  cache_dir: ./.cache_translate
+  thread_num: 4
