@@ -15,6 +15,39 @@ import openai
 import json_repair
 from diskcache import Cache
 
+# 导入外部定义的 Prompts
+import prompts
+
+# 默认ASS文件头
+ass_header = """[Script Info]
+Title: Default Aegisub file
+ScriptType: v4.00+
+WrapStyle: 0
+PlayResX: 1280
+PlayResY: 960
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Microsoft YaHei,60,&H0000FFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+# ###########需要清理的内容#######################
+# 去掉开头的标点符号和空白符
+BLANK_HEAD_RE = re.compile(r'^[^\w(（\[「【\'"‘“-]+', flags=re.UNICODE|re.MULTILINE)
+# text = re.sub(r'^[\W]+', '', text, flags=re.UNICODE)
+
+# 将文本中重复了2次及以上的多字字符串替换为1次
+REPEAT_CONTENT_RE = re.compile(r'(.{2,})([\s,.!?;，。！？；]+)\1', flags=re.UNICODE|re.MULTILINE)
+
+# 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
+BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔�んっはいふぁっあうちゅちあたえ]*$', flags=re.UNICODE|re.MULTILINE)
+###############################################################
+
+
 # ==========================================
 # 1. 基础数据结构 (Entities)
 # ==========================================
@@ -28,7 +61,7 @@ class SubtitleProcessData:
 class ASRDataSeg:
     def __init__(self, text: str, start_time: str, end_time: str, index: int, translated_text: str = ""):
         self.text = text
-        self.start_time = start_time
+        self.start_time = start_time # 格式: 00:00:00,000
         self.end_time = end_time
         self.index = index
         self.translated_text = translated_text
@@ -37,33 +70,88 @@ class ASRData:
     def __init__(self, segments: List[ASRDataSeg]):
         self.segments = sorted(segments, key=lambda x: x.index)
 
+    @staticmethod    # 清理字幕文件
+    def clean_line(text: str) -> str:
+        """
+        1. 去掉首尾【一般】标点
+        2. 同时清除收尾标点，结尾的问号需要保留
+        """
+        text = text.strip()
+        if not text:
+            return ''
+
+        # 将文本中重复了2次及以上的多字字符串替换为1次
+        text = REPEAT_CONTENT_RE.sub(r'\1', text)
+        # 去掉开头的标点符号和空白符
+        text = BLANK_HEAD_RE.sub(r'', text)
+        # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
+        text = BLANK_RE.sub(r'', text)
+
+        return text.strip()
+
     @staticmethod
     def from_srt(file_path: str) -> "ASRData":
-        # 使用 utf-8-sig 处理可能存在的 BOM
         with open(file_path, 'r', encoding='utf-8-sig') as f:
             content = f.read().strip()
         
         segments = []
-        # 更加健壮的正则表达式，兼容多种换行情况
         pattern = re.compile(r'(\d+)\s*\n(\d{2}:\d{2}:\d{2},\d{3} --> \d{2}:\d{2}:\d{2},\d{3})\s*\n(.*?)(?=\n\s*\n\d+|\s*$)', re.DOTALL)
         for match in pattern.finditer(content):
             idx = int(match.group(1))
             times = match.group(2).split(' --> ')
-            text = match.group(3).strip()
+            # text = match.group(3).strip()
+            text = ASRData.clean_line(match.group(3))
             segments.append(ASRDataSeg(text, times[0], times[1], idx))
         
         if not segments:
             raise ValueError("无法解析 SRT 文件，请检查格式是否标准。")
         return ASRData(segments)
 
+    def _srt_to_ass_time(self, srt_time: str) -> str:
+        """将 SRT 时间格式 00:00:00,000 转换为 ASS 格式 0:00:00.00"""
+        # 替换逗号为点
+        t = srt_time.replace(',', '.')
+        # 去掉小时前面的第一个0 (如果是 00:...)
+        if t.startswith('0'):
+            t = t[1:]
+        # 毫秒三位转两位 (123 -> 12)
+        parts = t.split('.')
+        if len(parts) > 1:
+            ms = parts[1][:2]
+            t = f"{parts[0]}.{ms}"
+        return t
+
     def to_srt(self, output_path: str, bilingual: bool = False):
         with open(output_path, 'w', encoding='utf-8') as f:
             for seg in self.segments:
                 f.write(f"{seg.index}\n{seg.start_time} --> {seg.end_time}\n")
+                src = ASRData.clean_line(seg.text)
+                translated =  ASRData.clean_line(seg.translated_text)
                 if bilingual:
-                    f.write(f"{seg.text}\n{seg.translated_text}\n\n")
+                    f.write(f"{translated}\n{src}\n\n")
                 else:
-                    f.write(f"{seg.translated_text if seg.translated_text else seg.text}\n\n")
+                    f.write(f"{translated if translated else src}\n\n")
+
+    def to_ass(self, output_path: str, bilingual: bool = False):
+        with open(output_path, 'w', encoding='utf-8-sig') as f:
+            f.write(ass_header + "\n")
+            for seg in self.segments:
+                start = self._srt_to_ass_time(seg.start_time)
+                end = self._srt_to_ass_time(seg.end_time)
+                
+                # 文本处理
+                src = ASRData.clean_line(seg.text)
+                translated =  ASRData.clean_line(seg.translated_text)
+                if bilingual:
+                    # ASS 使用 \N 表示换行
+                    text = f"{translated}\\N{src}"
+                else:
+                    text = translated if translated else src
+                
+                # 清洗文本中的换行符为ASS换行符
+                text = text.replace('\n', '\\N')
+                
+                f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n")
 
 # ==========================================
 # 2. 翻译器基类 (BaseTranslator)
@@ -107,7 +195,6 @@ class BaseTranslator(ABC):
         return asr_data
 
     def _safe_translate_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
-        # 生成缓存键：包含模型参数、源语言、目标语言和文本内容的哈希
         key_data = [asdict(d) for d in chunk]
         cache_key = f"{self.__class__.__name__}:{generate_cache_key(key_data)}:{self.source_lang}:{self.target_lang}"
         
@@ -141,7 +228,6 @@ class LLMTranslator(BaseTranslator):
     def __init__(self, api_config: dict, prompts: dict, thread_num: int, batch_num: int, 
                 source_lang: str, target_lang: str, cache_dir: str, is_reflect: bool = False):
         
-        # 显式调用父类构造函数，修复 TypeError
         super().__init__(
             thread_num=thread_num, 
             batch_num=batch_num, 
@@ -172,7 +258,6 @@ class LLMTranslator(BaseTranslator):
             
             for d in chunk:
                 val = result_dict.get(str(d.index), d.original_text)
-                # 处理反思模式下的嵌套结构
                 if self.is_reflect and isinstance(val, dict):
                     d.translated_text = val.get('native_translation', str(val))
                 else:
@@ -198,7 +283,6 @@ class LLMTranslator(BaseTranslator):
                 response_format={"type": "json_object"}
             )
             content = response.choices[0].message.content
-            # 使用 json_repair 修复 LLM 可能返回的非标准 JSON
             resp_dict = json_repair.loads(content)
             last_resp_dict = resp_dict
             
@@ -249,56 +333,25 @@ class LLMTranslator(BaseTranslator):
         return chunk
 
 # ==========================================
-# 4. 默认 Prompt 模板
-# ==========================================
-
-DEFAULT_PROMPTS = {
-    "standard": """You are a professional subtitle translator specializing in ${target_language}.
-<guidelines>
-- Translations must follow ${target_language} expression conventions, flow naturally.
-- Strictly maintain one-to-one correspondence of subtitle numbering.
-- Source language is ${source_language}.
-</guidelines>
-<output_format>
-{ "index": "Translated text" }
-</output_format>""",
-    
-    "single": "Translate the following ${source_language} text into ${target_language}. Output only the result.",
-    
-    "reflect": """You are a professional subtitle translator. Source: ${source_language}, Target: ${target_language}.
-<instructions>
-Stage 1: Initial Translation.
-Stage 2: Machine Translation Detection & Deep Analysis (Structural rigidity, cultural mismatch).
-Stage 3: Native-Quality Rewrite.
-</instructions>
-<output_format>
-{
-  "index": {
-    "initial_translation": "...",
-    "reflection": "...",
-    "native_translation": "..."
-  }
-}
-</output_format>"""
-}
-
-# ==========================================
 # 5. CLI 主程序
 # ==========================================
 
 def main():
     parser = argparse.ArgumentParser(description="LLM Subtitle Translator--by liug")
     parser.add_argument("-i", "--input", required=True, help="输入 SRT 文件路径")
-    parser.add_argument("-o", "--output", help="输出 SRT 文件路径")
+    parser.add_argument("-o", "--output", help="输出文件路径 (支持 .srt 或 .ass)")
     parser.add_argument("-s", "--source", default="Japanese", help="源语言 (默认: Japanese)")
     parser.add_argument("-l", "--lang", default="简体中文", help="目标语言 (默认: 简体中文)")
     parser.add_argument("-c", "--config", default="config.yaml", help="配置文件路径")
-    parser.add_argument("--reflect", action="store_true", help="开启反思模式 (更高质量，更多 Token)")
-    parser.add_argument("--only-result", action="store_true", help="只输出翻译结果，不保留原文对照")
+    parser.add_argument("--format", choices=['srt', 'ass'], default='srt', help="输出格式 (默认: srt)")
+    parser.add_argument("--reflect", action="store_true", help="开启反思模式")
+    parser.add_argument("--bilingual", action="store_true", help="输出双语对照")
     
     args = parser.parse_args()
+    # 获取提示词并组成词典,过滤掉系统内置属性（以 __ 开头的）
+    PROMPTS = {k: v for k, v in vars(prompts).items() if not k.startswith("__")}
 
-    # 加载或创建配置文件
+    # 加载或创建配置文件 (注意：这里不再在 yaml 中存储 prompts)
     if not os.path.exists(args.config):
         config = {
             "api": {
@@ -310,8 +363,7 @@ def main():
                 "thread_num": 4,
                 "batch_num": 10,
                 "cache_dir": "./.cache_sub_trans"
-            },
-            "prompts": DEFAULT_PROMPTS
+            }
         }
         with open(args.config, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, allow_unicode=True)
@@ -332,7 +384,7 @@ def main():
     # 初始化翻译器
     translator = LLMTranslator(
         api_config=config['api'],
-        prompts=config.get('prompts', DEFAULT_PROMPTS),
+        prompts=PROMPTS, # 使用 prompts.py 中的内容
         thread_num=config['settings'].get('thread_num', 4),
         batch_num=config['settings'].get('batch_num', 10),
         source_lang=args.source,
@@ -346,12 +398,28 @@ def main():
     try:
         translated_data = translator.translate(asr_data)
         
+        # 确定输出路径和格式
+        output_format = args.format
+        if args.output:
+            if args.output.lower().endswith('.ass'):
+                output_format = 'ass'
+            elif args.output.lower().endswith('.srt'):
+                output_format = 'srt'
+            output_file = args.output
+        else:
+            output_file = args.input.replace(".srt", f".{args.lang}.{output_format}")
+
         # 保存结果
-        output_file = args.output or args.input.replace(".srt", f".{args.lang}.srt")
-        translated_data.to_srt(output_file, bilingual=args.only_result)
+        if output_format == 'ass':
+            translated_data.to_ass(output_file, bilingual=args.bilingual)
+        else:
+            translated_data.to_srt(output_file, bilingual=args.bilingual)
+            
         print(f"[+] 翻译成功！保存至: {output_file}")
     except Exception as e:
         print(f"[-] 翻译过程中出现异常: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         translator.stop()
 

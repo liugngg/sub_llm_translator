@@ -25,7 +25,7 @@
 ## 3. 打包命令
 
 - 生成单文件格式
-  `pyinstaller -i liug.ico -F -w main.py --clean -n LLM字幕翻译`
+  `pyinstaller -i -F main.py --clean -n LLM字幕翻译`
 
 - 生成单文件格式（Nuitka --onefile自动压缩）
 - 如果你还没有在当前环境中安装 nuitka，你可以使用 --with 参数让 uv 临时安装并运行它，而无需手动 pip install
