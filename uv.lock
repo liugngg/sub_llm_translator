@@ -344,7 +344,7 @@ wheels = [
 ]
 
 [[package]]
-name = "sub-translator"
+name = "sub-llm-translator"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [

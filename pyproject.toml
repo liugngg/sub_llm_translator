@@ -1,5 +1,5 @@
 [project]
-name = "sub-translator"
+name = "sub_LLM_Translator"
 version = "0.1.0"
 description = "Using LLM translate subtitles"
 readme = "README.md"
