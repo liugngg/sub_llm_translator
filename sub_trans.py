@@ -216,7 +216,7 @@ class LLMTranslator(BaseTranslator):
     RETRY_LIMIT = 2 # 整个 Chunk 失败后的重试次数
 
     def __init__(self, api_config: dict, prompts: dict, thread_num: int, batch_num: int, 
-                source_lang: str, target_lang: str, cache_dir: str, is_reflect: bool = False):
+                source_lang: str, target_lang: str, cache_dir: str, is_reflect: bool = False, temperature: str=0.6):
         
         super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir)
         # 设置LLM API接口
@@ -224,6 +224,7 @@ class LLMTranslator(BaseTranslator):
         self.model = api_config['model']
         self.prompts = prompts
         self.is_reflect = is_reflect
+        self.temperature = temperature
 
     def _get_prompt(self, ptype: str) -> str:
         content = self.prompts.get(ptype, "")
@@ -234,7 +235,7 @@ class LLMTranslator(BaseTranslator):
 
     def _translate_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
         """
-        改进3：当 chunk 翻译失败后，识别出错条目，批量重重试，而不是直接逐条翻译。
+        改进：当 chunk 翻译失败后，识别出错条目，批量重重试，而不是直接逐条翻译。
         """
         # 1. 尝试整体翻译
         result_dict = self._attempt_chunk_translate(chunk)
@@ -275,14 +276,25 @@ class LLMTranslator(BaseTranslator):
         return chunk
 
     def _attempt_chunk_translate(self, chunk: List[SubtitleProcessData]) -> Dict[str, Any]:
-        """执行 Agent 循环翻译逻辑，返回成功解析的字典"""
+        """执行 Agent 循环翻译字幕块，返回成功解析的字典"""
+        self.pbar.write(f"[+]正在翻译字幕块：{chunk[0].index} - {chunk[-1].index}")
         subtitle_dict = {str(d.index): d.original_text for d in chunk}
         prompt_type = "reflect" if self.is_reflect else "standard"
         system_prompt = self._get_prompt(prompt_type)
         
         try:
             return self._agent_loop(system_prompt, subtitle_dict)
-        except Exception:
+        except openai.RateLimitError as e:
+            self.pbar.write(f"Error: OpenAI Rate Limit Error: {str(e)}")
+            raise
+        except openai.AuthenticationError as e:
+            self.pbar.write(f"Error: OpenAI Authentication Error: {str(e)}")
+            raise
+        except openai.NotFoundError as e:
+            self.pbar.write(f"Error: OpenAI NotFound Error: {str(e)}")
+            raise
+        except Exception as e:
+            self.pbar.write(f"Error: {str(e)}")
             return {}
 
     def _agent_loop(self, system_prompt: str, subtitle_dict: Dict[str, str]) -> Dict[str, Any]:
@@ -297,7 +309,7 @@ class LLMTranslator(BaseTranslator):
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=0.3,
+                    temperature=self.temperature,
                     response_format={"type": "json_object"}
                 )
                 content = response.choices[0].message.content
@@ -310,7 +322,7 @@ class LLMTranslator(BaseTranslator):
                 is_valid, error_msg = self._validate_response(resp_dict, subtitle_dict)
                 if is_valid:
                     return resp_dict
-                self.pbar.write(f"[!] 第{step + 1}次翻译中出现错误: {error_msg}")
+                # self.pbar.write(f"[!] 第{step + 1}次翻译中出现错误: {error_msg}")
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": f"Error: {error_msg}. Please fix and output the complete JSON object again."})
                 time.sleep(1)
@@ -341,17 +353,19 @@ class LLMTranslator(BaseTranslator):
         self.pbar.write(f"[*] 进入逐条翻译模式...")
         for d in chunk:
             try:
+                self.pbar.write(f"[*] 正在翻译第{d.index}条字幕...")
                 resp = self.client.chat.completions.create(
                     model=self.model,
                     messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": d.original_text}
                     ],
-                    temperature=0.3,
-                    timeout=15 # 单条翻译增加超时控制
+                    temperature=self.temperature,
+                    timeout=10 # 单条翻译增加超时控制
                 )
                 d.translated_text = resp.choices[0].message.content.strip()
             except Exception:
+                self.pbar.write(f"[*] Error: 第{d.index}条字幕翻译出错，请注意检查！")
                 d.translated_text = d.original_text
         self.pbar.write(f"[*] 逐条翻译完成。")
         return chunk
@@ -377,7 +391,7 @@ def main():
     if not os.path.exists(args.config):
         config = {
             "api": {"api_key": "YOUR_API_KEY", "base_url": "https://api.openai.com/v1", "model": "gpt-4o"},
-            "settings": {"thread_num": 2, "batch_num": 100, "cache_dir": "./.cache_sub_trans"}
+            "settings": {"thread_num": 4, "batch_num": 80, "cache_dir": "./.cache_sub_trans", "temperature": 0.6}
         }
         with open(args.config, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, allow_unicode=True)
@@ -401,18 +415,26 @@ def main():
         source_lang=args.source,
         target_lang=args.lang,
         cache_dir=config['settings'].get('cache_dir', './.cache_sub_trans'),
-        is_reflect=args.reflect
+        is_reflect=args.reflect,
+        temperature=config['settings'].get('temperature', 0.6)
     )
 
-    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num} | 字幕数量/组: {translator.batch_num}")
+    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num} | 块大小: {translator.batch_num}")
     
     try:
         translated_data = translator.translate(asr_data)
         
         output_format = args.format
         if args.output:
-            output_format = 'ass' if args.output.lower().endswith('.ass') else 'srt'
-            output_file = args.output
+            if os.path.isdir(args.output): # 如果是目录
+                # 获取输入文件的基本名称（不含路径和后缀）
+                input_filename = os.path.basename(args.input)
+                name_without_ext = os.path.splitext(input_filename)[0]
+                # 在该目录下拼接新文件名，默认用 srt（或根据需求改）
+                output_file = os.path.join(args.output, f"{name_without_ext}.{args.lang}.{output_format}")
+            else:  # 否则是一个具体的文件路径
+                output_file = args.output
+                output_format = 'ass' if args.output.lower().endswith('.ass') else 'srt'
         else:
             output_file = args.input.replace(".srt", f".{args.lang}.{output_format}")
 

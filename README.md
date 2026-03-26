@@ -29,10 +29,10 @@
 
 - 生成单文件格式（Nuitka --onefile自动压缩）
 - 如果你还没有在当前环境中安装 nuitka，你可以使用 --with 参数让 uv 临时安装并运行它，而无需手动 pip install
-  `uv run --with nuitka python -m nuitka --mingw64 --onefile --lto=yes --show-progress --output-dir=dist --remove-output --windows-console-mode=force sub_trans.py`
+  `uv run --with nuitka python -m nuitka --mingw64 --onefile --lto=yes --show-progress --output-dir=dist --remove-output sub_trans.py`
 
 - 生成单文件格式（Nuitka --使用upx 压缩）
-  `uv run --with nuitka python -m nuitka --mingw64 --onefile --onefile-no-compression --plugin-enable=upx --lto=yes --show-progress --output-dir=dist --remove-output --windows-console-mode=force sub_trans.py`
+  `uv run --with nuitka python -m nuitka --mingw64 --onefile --onefile-no-compression --plugin-enable=upx --lto=yes --show-progress --output-dir=dist --remove-output sub_trans.py`
 
 ## 4. 作者
 
