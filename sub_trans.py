@@ -142,7 +142,9 @@ class BaseTranslator(ABC):
         self.cache = Cache(cache_dir)
         # --- 改进2：自动清除已过期的缓存 ---
         self.cache.expire() 
-        
+
+        # 全局进度条变量：
+        self.pbar = None
         self.executor = ThreadPoolExecutor(max_workers=thread_num)
         self.is_running = True
         atexit.register(self.stop)
@@ -157,7 +159,7 @@ class BaseTranslator(ABC):
         translated_map = {}
         
         # --- 改进1：增加 tqdm 进度条 ---
-        pbar = tqdm(total=len(chunks), desc="[*] 翻译进度", unit="chunk")
+        self.pbar = tqdm(total=len(chunks), desc="[*] 翻译进度", unit="chunk")
         
         futures = {self.executor.submit(self._safe_translate_chunk, chunk): chunk for chunk in chunks}
         
@@ -170,9 +172,9 @@ class BaseTranslator(ABC):
                 # 理论上 safe_translate 不会抛出异常，因为内部有 fallback
                 print(f"\n[-] 批处理执行致命错误: {e}")
             finally:
-                pbar.update(1)
+                self.pbar.update(1)
         
-        pbar.close()
+        self.pbar.close()
 
         for seg in asr_data.segments:
             seg.translated_text = translated_map.get(seg.index, "")
@@ -185,6 +187,7 @@ class BaseTranslator(ABC):
         
         cached = self.cache.get(cache_key)
         if cached:
+            self.pbar.write(f"[*] 命中缓存: {cache_key}")
             return [SubtitleProcessData(**d) for d in cached]
 
         result = self._translate_chunk(chunk)
@@ -251,7 +254,7 @@ class LLMTranslator(BaseTranslator):
 
         # 3. 如果有缺失条目，尝试针对这些条目进行一次“聚合重试”
         if missing_indices:
-            print(f"\n[!] Chunk 中有 {len(missing_indices)} 条翻译失败，正在尝试精准重试...")
+            self.pbar.write(f"\n[!] Chunk 中有 {len(missing_indices)} 条翻译失败，正在尝试精准重试...")
             retry_result = self._attempt_chunk_translate(missing_indices)
             
             # 再次填充
@@ -266,7 +269,7 @@ class LLMTranslator(BaseTranslator):
             
             # 4. 如果精准重试依然失败，最后才进入最后的兜底（逐条）
             if still_missing:
-                # print(f"\n[!] 重试后仍有 {len(still_missing)} 条失败，进入逐条翻译兜底模式。")
+                self.pbar.write(f"\n[!] 重试后仍有 {len(still_missing)} 条失败，进入逐条翻译兜底模式。")
                 self._translate_single_fallback(still_missing)
             
         return chunk
@@ -307,7 +310,7 @@ class LLMTranslator(BaseTranslator):
                 is_valid, error_msg = self._validate_response(resp_dict, subtitle_dict)
                 if is_valid:
                     return resp_dict
-                
+                self.pbar.write(f"[!] 第{step + 1}次翻译中出现错误: {error_msg}")
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": f"Error: {error_msg}. Please fix and output the complete JSON object again."})
                 time.sleep(1)
@@ -335,6 +338,7 @@ class LLMTranslator(BaseTranslator):
 
     def _translate_single_fallback(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
         system_prompt = self._get_prompt("single")
+        self.pbar.write(f"[*] 进入逐条翻译模式...")
         for d in chunk:
             try:
                 resp = self.client.chat.completions.create(
@@ -349,6 +353,7 @@ class LLMTranslator(BaseTranslator):
                 d.translated_text = resp.choices[0].message.content.strip()
             except Exception:
                 d.translated_text = d.original_text
+        self.pbar.write(f"[*] 逐条翻译完成。")
         return chunk
 
 # ==========================================
@@ -391,8 +396,8 @@ def main():
     translator = LLMTranslator(
         api_config=config['api'],
         prompts=PROMPTS,
-        thread_num=config['settings'].get('thread_num', 2),
-        batch_num=config['settings'].get('batch_num', 100),
+        thread_num=config['settings'].get('thread_num', 4),
+        batch_num=config['settings'].get('batch_num', 80),
         source_lang=args.source,
         target_lang=args.lang,
         cache_dir=config['settings'].get('cache_dir', './.cache_sub_trans'),
