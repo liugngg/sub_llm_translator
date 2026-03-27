@@ -6,12 +6,14 @@ import argparse
 import re
 import time
 import atexit
+import sys # 导入 sys 模块用于程序退出
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 
 import openai
+from openai import OpenAI, RateLimitError, AuthenticationError, NotFoundError, APITimeoutError # 导入更具体的异常
 import json_repair
 from diskcache import Cache
 from tqdm import tqdm  # 导入 tqdm
@@ -30,7 +32,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Microsoft YaHei,60,&H0000FFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+Style: Default,Microsoft YaHei,60,&H0000FFFF,&H000000FF,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -45,7 +47,7 @@ BLANK_HEAD_RE = re.compile(r'^[^\w(（\[「【\'"‘“-]+', flags=re.UNICODE|re
 REPEAT_CONTENT_RE = re.compile(r'(.{2,})([\s,.!?;，。！？；]+)\1', flags=re.UNICODE|re.MULTILINE)
 
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
-BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔�んっはいふぁっあうちゅちあたえ]*$', flags=re.UNICODE|re.MULTILINE)
+BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔んっはいふぁっあうちゅちあたえ]*$', flags=re.UNICODE|re.MULTILINE)
 ###############################################################
 
 # ==========================================
@@ -129,18 +131,24 @@ class ASRData:
                 f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n")
 
 # ==========================================
-# 2. 基础翻译器基类 (改进：进度条 & 缓存清理)
+# 2. 基础翻译器基类 (改进：进度条 & 缓存清理 & 新的错误处理/重试机制)
 # ==========================================
 
+class TranslationError(Exception):
+    """自定义异常，用于表示翻译过程中LLM返回结果不符合预期"""
+    pass
+
 class BaseTranslator(ABC):
-    def __init__(self, thread_num: int, batch_num: int, source_lang: str, target_lang: str, cache_dir: str):
+    MAX_CHUNK_RETRIES = 2 # 针对单个chunk的最大重试次数
+
+    def __init__(self, thread_num: int, batch_num: int, source_lang: str, target_lang: str, cache_dir: str, timeout: int):
         self.thread_num = thread_num
         self.batch_num = batch_num
         self.source_lang = source_lang
         self.target_lang = target_lang
+        self.timeout = timeout # 新增 timeout 参数
         # 设置缓存目录并清理过期缓存
         self.cache = Cache(cache_dir)
-        # --- 改进2：自动清除已过期的缓存 ---
         self.cache.expire() 
 
         # 全局进度条变量：
@@ -158,10 +166,9 @@ class BaseTranslator(ABC):
         chunks = [translate_data_list[i:i + self.batch_num] for i in range(0, len(translate_data_list), self.batch_num)]
         translated_map = {}
         
-        # --- 改进1：增加 tqdm 进度条 ---
         self.pbar = tqdm(total=len(chunks), desc="[*] 翻译进度", unit="chunk")
         
-        futures = {self.executor.submit(self._safe_translate_chunk, chunk): chunk for chunk in chunks}
+        futures = {self.executor.submit(self._process_chunk_with_retry, chunk): chunk for chunk in chunks}
         
         for future in as_completed(futures):
             try:
@@ -169,8 +176,10 @@ class BaseTranslator(ABC):
                 for data in result_chunk:
                     translated_map[data.index] = data.translated_text
             except Exception as e:
-                # 理论上 safe_translate 不会抛出异常，因为内部有 fallback
-                print(f"\n[-] 批处理执行致命错误: {e}")
+                # _process_chunk_with_retry 内部已经处理了重试和退出逻辑，
+                # 如果到这里抛出异常，说明是其他未知且致命的线程池错误。
+                self.pbar.write(f"\n[-] 批处理执行遇到未知致命错误: {e}")
+                sys.exit(1) # 发现严重错误则退出
             finally:
                 self.pbar.update(1)
         
@@ -181,23 +190,51 @@ class BaseTranslator(ABC):
         
         return asr_data
 
-    def _safe_translate_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
-        key_data = [asdict(d) for d in chunk]
-        cache_key = f"{self.__class__.__name__}:{generate_cache_key(key_data)}:{self.source_lang}:{self.target_lang}:{self.batch_num}"
+    def _process_chunk_with_retry(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
+        """
+        处理单个 chunk，包含缓存、错误处理和重试逻辑。
+        """
+        cache_key = self._generate_chunk_cache_key(chunk)
         
         cached = self.cache.get(cache_key)
         if cached:
             self.pbar.write(f"[*] 命中缓存: {cache_key}")
             return [SubtitleProcessData(**d) for d in cached]
 
-        result = self._translate_chunk(chunk)
-        # 设置缓存，过期时间7天
-        self.cache.set(cache_key, [asdict(d) for d in result], expire=86400 * 7)
-        return result
+        # 重试逻辑
+        for attempt in range(1, self.MAX_CHUNK_RETRIES + 1):
+            try:
+                result = self._translate_chunk(chunk)
+                # 如果成功，设置缓存并返回
+                self.cache.set(cache_key, [asdict(d) for d in result], expire=86400 * 7)
+                return result
+            
+            except (APITimeoutError, TranslationError) as e:
+                if attempt < self.MAX_CHUNK_RETRIES:
+                    self.pbar.write(f"\n[-] 翻译 chunk 失败 (尝试 {attempt}/{self.MAX_CHUNK_RETRIES})，错误: {e}。1秒后重试...")
+                    time.sleep(1) # 等待1秒后重试
+                else:
+                    self.pbar.write(f"\n[-] 翻译 chunk 失败 (已达最大重试次数 {self.MAX_CHUNK_RETRIES})，错误: {e}。程序将退出。")
+                    self.stop()
+                    time.sleep(2)
+                    sys.exit(1) # 达到最大重试次数后退出
+            except Exception as e:
+                self.pbar.write(f"\n[-] 翻译 chunk 遇到未知错误: {e}。程序将退出。")
+                self.stop()
+                time.sleep(2)
+                sys.exit(1) # 其他意外错误，也直接退出
+
+        # 理论上不会执行到这里，因为达到最大重试次数会调用 sys.exit()
+        return [] 
 
     @abstractmethod
     def _translate_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
+        """抽象方法，子类实现具体的翻译逻辑，如果失败应抛出 TranslationError 或 OpenAI API 异常"""
         pass
+
+    def _generate_chunk_cache_key(self, chunk: List[SubtitleProcessData]) -> str:
+        key_data = [asdict(d) for d in chunk]
+        return f"{self.__class__.__name__}:{generate_cache_key(key_data)}:{self.source_lang}:{self.target_lang}:{self.batch_num}"
 
     def stop(self):
         self.is_running = False
@@ -213,14 +250,14 @@ def generate_cache_key(data: Any) -> str:
 
 class LLMTranslator(BaseTranslator):
     MAX_STEPS = 3  # Agent 纠错循环
-    RETRY_LIMIT = 2 # 整个 Chunk 失败后的重试次数
 
     def __init__(self, api_config: dict, prompts: dict, thread_num: int, batch_num: int, 
-                source_lang: str, target_lang: str, cache_dir: str, is_reflect: bool = False, temperature: str=0.6):
+                source_lang: str, target_lang: str, cache_dir: str, is_reflect: bool = False, 
+                temperature: float = 0.6, timeout: int = 60): # 增加 timeout 参数及其默认值
         
-        super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir)
+        super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir, timeout)
         # 设置LLM API接口
-        self.client = openai.OpenAI(api_key=api_config['api_key'], base_url=api_config['base_url'])
+        self.client = OpenAI(api_key=api_config['api_key'], base_url=api_config['base_url'])
         self.model = api_config['model']
         self.prompts = prompts
         self.is_reflect = is_reflect
@@ -234,68 +271,27 @@ class LLMTranslator(BaseTranslator):
                 .replace("${custom_prompt}", ""))
 
     def _translate_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
-        """
-        改进：当 chunk 翻译失败后，识别出错条目，批量重重试，而不是直接逐条翻译。
-        """
-        # 1. 尝试整体翻译
-        result_dict = self._attempt_chunk_translate(chunk)
-        
-        # 2. 检查结果，识别缺失的条目
-        missing_indices = []
-        for d in chunk:
-            idx_str = str(d.index)
-            if idx_str in result_dict:
-                val = result_dict[idx_str]
-                if self.is_reflect and isinstance(val, dict):
-                    d.translated_text = val.get('native_translation', str(val))
-                else:
-                    d.translated_text = str(val)
-            else:
-                missing_indices.append(d)
-
-        # 3. 如果有缺失条目，尝试针对这些条目进行一次“聚合重试”
-        if missing_indices:
-            self.pbar.write(f"\n[!] Chunk 中有 {len(missing_indices)} 条翻译失败，正在尝试精准重试...")
-            retry_result = self._attempt_chunk_translate(missing_indices)
-            
-            # 再次填充
-            still_missing = []
-            for d in missing_indices:
-                idx_str = str(d.index)
-                if idx_str in retry_result:
-                    val = retry_result[idx_str]
-                    d.translated_text = val.get('native_translation', str(val)) if self.is_reflect and isinstance(val, dict) else str(val)
-                else:
-                    still_missing.append(d)
-            
-            # 4. 如果精准重试依然失败，最后才进入最后的兜底（逐条）
-            if still_missing:
-                self.pbar.write(f"\n[!] 重试后仍有 {len(still_missing)} 条失败，进入逐条翻译兜底模式。")
-                self._translate_single_fallback(still_missing)
-            
-        return chunk
-
-    def _attempt_chunk_translate(self, chunk: List[SubtitleProcessData]) -> Dict[str, Any]:
-        """执行 Agent 循环翻译字幕块，返回成功解析的字典"""
-        self.pbar.write(f"[+]正在翻译字幕块：{chunk[0].index} - {chunk[-1].index}")
         subtitle_dict = {str(d.index): d.original_text for d in chunk}
         prompt_type = "reflect" if self.is_reflect else "standard"
         system_prompt = self._get_prompt(prompt_type)
         
         try:
-            return self._agent_loop(system_prompt, subtitle_dict)
-        except openai.RateLimitError as e:
-            self.pbar.write(f"Error: OpenAI Rate Limit Error: {str(e)}")
-            raise
-        except openai.AuthenticationError as e:
-            self.pbar.write(f"Error: OpenAI Authentication Error: {str(e)}")
-            raise
-        except openai.NotFoundError as e:
-            self.pbar.write(f"Error: OpenAI NotFound Error: {str(e)}")
-            raise
+            result_dict = self._agent_loop(system_prompt, subtitle_dict)
+            
+            for d in chunk:
+                val = result_dict.get(str(d.index), d.original_text)
+                if self.is_reflect and isinstance(val, dict):
+                    # 在反思模式下，尝试从 'native_translation' 获取，否则使用原始值
+                    d.translated_text = val.get('native_translation', str(val))
+                else:
+                    d.translated_text = str(val)
+            return chunk
+        except (RateLimitError, APITimeoutError, TranslationError) as e:
+            # 直接将这些错误向上抛出，由 _process_chunk_with_retry 处理
+            raise e
         except Exception as e:
-            self.pbar.write(f"Error: {str(e)}")
-            return {}
+            # 捕获其他所有未预料的错误，并包装成 TranslationError
+            raise TranslationError(f"在LLM翻译或解析结果时发生未知错误: {e}") from e
 
     def _agent_loop(self, system_prompt: str, subtitle_dict: Dict[str, str]) -> Dict[str, Any]:
         messages = [
@@ -309,66 +305,81 @@ class LLMTranslator(BaseTranslator):
                 response = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    temperature=self.temperature,
-                    response_format={"type": "json_object"}
+                    temperature=self.temperature, # 使用实例的 temperature
+                    response_format={"type": "json_object"},
+                    timeout=self.timeout # 使用配置中的 TIMEOUT
                 )
-                content = response.choices[0].message.content
+            except (AuthenticationError, NotFoundError) as e:
+                # 这些致命错误直接退出
+                self.pbar.write(f"\n[-] 发生致命错误：OpenAI API 认证/资源错误，无法继续: {e}")
+                self.stop()
+                self.pbar.write(f"\n[-] 程序正在退出。。。")
+                time.sleep(2)
+                sys.exit(1) # 致命错误，直接退出
+            except (RateLimitError, APITimeoutError) as e:
+                # 这些错误向上抛出
+                raise e
+            except Exception as e:
+                # 其他任何 OpenAI 库可能抛出的错误，视为需要重试的 TranslationError
+                raise TranslationError(f"OpenAI API 调用发生错误: {e}") from e
+
+            content = response.choices[0].message.content
+            
+            try:
+                # 使用 json_repair 处理可能不完整的 JSON
                 resp_dict = json_repair.loads(content)
-                if not isinstance(resp_dict, dict):
-                    raise ValueError("JSON is not a dict")
-                
                 last_resp_dict = resp_dict
-                
-                is_valid, error_msg = self._validate_response(resp_dict, subtitle_dict)
-                if is_valid:
-                    return resp_dict
-                # self.pbar.write(f"[!] 第{step + 1}次翻译中出现错误: {error_msg}")
+            except json.JSONDecodeError as e:
+                # 如果 JSON 格式不正确，视为需要重试的 TranslationError
+                error_msg = f"LLM返回的JSON格式不正确: {e}. 原始内容: {content[:200]}..."
+                self.pbar.write(f"\n[-] {error_msg}")
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": f"Error: {error_msg}. Please fix and output the complete JSON object again."})
-                time.sleep(1)
-            except Exception as e:
-                if step == self.MAX_STEPS - 1: raise e
-                continue
+                continue # 进入下一次 agent 循环尝试纠正
+
+            is_valid, error_msg = self._validate_response(resp_dict, subtitle_dict)
+            if is_valid:
+                return resp_dict
+            
+            # 如果验证失败，向模型发送纠错信息
+            self.pbar.write(f"\n[-] LLM返回结果验证失败 (尝试 {step+1}/{self.MAX_STEPS}): {error_msg}")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": f"Error: {error_msg}. Please fix and output the complete JSON object again."})
         
-        return last_resp_dict
+        # 达到最大纠错次数仍未成功，抛出 TranslationError
+        raise TranslationError(f"LLM在 {self.MAX_STEPS} 次纠错后仍未能返回正确格式的结果。最后一个结果: {last_resp_dict}")
 
     def _validate_response(self, resp_dict: Any, origin_dict: Dict[str, str]) -> Tuple[bool, str]:
+        if not isinstance(resp_dict, dict):
+            return False, f"返回结果不是一个字典类型，而是 {type(resp_dict)}"
+
         origin_keys = set(origin_dict.keys())
         resp_keys = set(resp_dict.keys())
         
+        # 确保所有原始键都在返回结果中
         if not origin_keys.issubset(resp_keys):
             missing = origin_keys - resp_keys
-            return False, f"Key 缺失: {missing}"
+            return False, f"返回结果缺少以下键: {missing}"
         
+        # 确保返回的字典没有多余的键 (可选，但有助于更严格的结构检查)
+        if not resp_keys.issubset(origin_keys):
+            extra = resp_keys - origin_keys
+            # 这里可以根据需要决定是返回 False 还是仅发出警告。
+            # 为了更严格，我们视为错误。
+            return False, f"返回结果包含不应存在的额外键: {extra}"
+
         if self.is_reflect:
             for k in origin_keys:
                 v = resp_dict.get(k)
-                if not isinstance(v, dict) or 'native_translation' not in v:
-                    return False, f"Key '{k}' 格式不符合反思模式要求"
+                if not isinstance(v, dict) or 'native_translation' not in v or not isinstance(v['native_translation'], str):
+                    return False, f"键 '{k}' 的值不符合反思模式的要求 (需为包含 'native_translation' 键的字典，且 'native_translation' 的值需为字符串)"
+        else:
+            for k in origin_keys:
+                v = resp_dict.get(k)
+                if not isinstance(v, str):
+                    return False, f"键 '{k}' 的值不符合标准模式的要求 (需为字符串类型)"
         
         return True, ""
-
-    def _translate_single_fallback(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
-        system_prompt = self._get_prompt("single")
-        self.pbar.write(f"[*] 进入逐条翻译模式...")
-        for d in chunk:
-            try:
-                self.pbar.write(f"[*] 正在翻译第{d.index}条字幕...")
-                resp = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": d.original_text}
-                    ],
-                    temperature=self.temperature,
-                    timeout=10 # 单条翻译增加超时控制
-                )
-                d.translated_text = resp.choices[0].message.content.strip()
-            except Exception:
-                self.pbar.write(f"[*] Error: 第{d.index}条字幕翻译出错，请注意检查！")
-                d.translated_text = d.original_text
-        self.pbar.write(f"[*] 逐条翻译完成。")
-        return chunk
 
 # ==========================================
 # 4. CLI 主程序 (保持原有逻辑，优化交互)
@@ -391,12 +402,18 @@ def main():
     if not os.path.exists(args.config):
         config = {
             "api": {"api_key": "YOUR_API_KEY", "base_url": "https://api.openai.com/v1", "model": "gpt-4o"},
-            "settings": {"thread_num": 4, "batch_num": 80, "cache_dir": "./.cache_sub_trans", "temperature": 0.6}
+            "settings": {
+                "thread_num": 4, 
+                "batch_num": 80, 
+                "cache_dir": "./.cache_sub_trans", 
+                "temperature": 0.6,
+                "timeout": 60 # 新增 TIMEOUT 参数
+            }
         }
         with open(args.config, 'w', encoding='utf-8') as f:
             yaml.dump(config, f, allow_unicode=True)
         print(f"[*] 已生成默认配置文件 {args.config}，请修改后运行。")
-        return
+        sys.exit(0) # 生成配置后退出
 
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
@@ -404,8 +421,8 @@ def main():
     try:
         asr_data = ASRData.from_srt(args.input)
     except Exception as e:
-        print(f"[-] 读取失败: {e}")
-        return
+        print(f"[-] 读取输入文件失败: {e}")
+        sys.exit(1)
 
     translator = LLMTranslator(
         api_config=config['api'],
@@ -416,10 +433,11 @@ def main():
         target_lang=args.lang,
         cache_dir=config['settings'].get('cache_dir', './.cache_sub_trans'),
         is_reflect=args.reflect,
-        temperature=config['settings'].get('temperature', 0.6)
+        temperature=config['settings'].get('temperature', 0.6),
+        timeout=config['settings'].get('timeout', 20) # 传入 timeout 参数
     )
 
-    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num} | 块大小: {translator.batch_num}")
+    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num} | 块大小: {translator.batch_num} | API超时: {translator.timeout}s")
     
     try:
         translated_data = translator.translate(asr_data)
@@ -445,7 +463,9 @@ def main():
             
         print(f"\n[+] 翻译成功！保存至: {output_file}")
     except Exception as e:
-        print(f"\n[-] 翻译过程中出现异常: {e}")
+        # 这里的异常捕获主要是针对 translate() 函数内部未处理的致命错误
+        print(f"\n[-] 翻译过程中出现未预期异常: {e}")
+        sys.exit(1)
     finally:
         translator.stop()
 
