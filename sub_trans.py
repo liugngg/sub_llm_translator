@@ -157,6 +157,12 @@ class BaseTranslator(ABC):
         self.is_running = True
         atexit.register(self.stop)
 
+    def write(self, msg: str):
+        if self.pbar: 
+            self.pbar.write(msg)
+        else:
+            print(msg)
+    
     def translate(self, asr_data: ASRData) -> ASRData:
         translate_data_list = [
             SubtitleProcessData(index=seg.index, original_text=seg.text)
@@ -178,7 +184,7 @@ class BaseTranslator(ABC):
             except Exception as e:
                 # _process_chunk_with_retry 内部已经处理了重试和退出逻辑，
                 # 如果到这里抛出异常，说明是其他未知且致命的线程池错误。
-                self.pbar.write(f"\n[-] 批处理执行遇到未知致命错误: {e}")
+                self.write(f"\n[-] 批处理执行遇到未知致命错误: {e}")
                 sys.exit(1) # 发现严重错误则退出
             finally:
                 self.pbar.update(1)
@@ -198,7 +204,7 @@ class BaseTranslator(ABC):
         
         cached = self.cache.get(cache_key)
         if cached:
-            self.pbar.write(f"[*] 命中缓存: {cache_key}")
+            self.write(f"[*] 命中缓存: {cache_key}")
             return [SubtitleProcessData(**d) for d in cached]
 
         # 重试逻辑
@@ -211,15 +217,15 @@ class BaseTranslator(ABC):
             
             except (APITimeoutError, TranslationError) as e:
                 if attempt < self.MAX_CHUNK_RETRIES:
-                    self.pbar.write(f"\n[-] 翻译 chunk 失败 (尝试 {attempt}/{self.MAX_CHUNK_RETRIES})，错误: {e}。1秒后重试...")
+                    self.write(f"\n[-] 翻译 chunk 失败 (尝试 {attempt}/{self.MAX_CHUNK_RETRIES})，错误: {e}。1秒后重试...")
                     time.sleep(1) # 等待1秒后重试
                 else:
-                    self.pbar.write(f"\n[-] 翻译 chunk 失败 (已达最大重试次数 {self.MAX_CHUNK_RETRIES})，错误: {e}。程序将退出。")
+                    self.write(f"\n[-] 翻译 chunk 失败 (已达最大重试次数 {self.MAX_CHUNK_RETRIES})，错误: {e}。程序将退出。")
                     self.stop()
                     time.sleep(2)
                     sys.exit(1) # 达到最大重试次数后退出
             except Exception as e:
-                self.pbar.write(f"\n[-] 翻译 chunk 遇到未知错误: {e}。程序将退出。")
+                self.write(f"\n[-] 翻译 chunk 遇到未知错误: {e}。程序将退出。")
                 self.stop()
                 time.sleep(2)
                 sys.exit(1) # 其他意外错误，也直接退出
@@ -311,9 +317,9 @@ class LLMTranslator(BaseTranslator):
                 )
             except (AuthenticationError, NotFoundError) as e:
                 # 这些致命错误直接退出
-                self.pbar.write(f"\n[-] 发生致命错误：OpenAI API 认证/资源错误，无法继续: {e}")
+                self.write(f"\n[-] 发生致命错误：OpenAI API 认证/资源错误，无法继续: {e}")
                 self.stop()
-                self.pbar.write(f"\n[-] 程序正在退出。。。")
+                self.write(f"\n[-] 程序正在退出。。。")
                 time.sleep(2)
                 sys.exit(1) # 致命错误，直接退出
             except (RateLimitError, APITimeoutError) as e:
@@ -332,7 +338,7 @@ class LLMTranslator(BaseTranslator):
             except json.JSONDecodeError as e:
                 # 如果 JSON 格式不正确，视为需要重试的 TranslationError
                 error_msg = f"LLM返回的JSON格式不正确: {e}. 原始内容: {content[:200]}..."
-                self.pbar.write(f"\n[-] {error_msg}")
+                self.write(f"\n[-] {error_msg}")
                 messages.append({"role": "assistant", "content": content})
                 messages.append({"role": "user", "content": f"Error: {error_msg}. Please fix and output the complete JSON object again."})
                 continue # 进入下一次 agent 循环尝试纠正
@@ -342,7 +348,7 @@ class LLMTranslator(BaseTranslator):
                 return resp_dict
             
             # 如果验证失败，向模型发送纠错信息
-            self.pbar.write(f"\n[-] LLM返回结果验证失败 (尝试 {step+1}/{self.MAX_STEPS}): {error_msg}")
+            self.write(f"\n[-] LLM返回结果验证失败 (尝试 {step+1}/{self.MAX_STEPS}): {error_msg}")
             messages.append({"role": "assistant", "content": content})
             messages.append({"role": "user", "content": f"Error: {error_msg}. Please fix and output the complete JSON object again."})
         
@@ -386,6 +392,22 @@ class LLMTranslator(BaseTranslator):
 # ==========================================
 
 def main():
+    def find_srt_files(input_path: str) -> List[str]:
+        srt_files = []
+        if not os.path.exists(input_path):
+            # raise FileNotFoundError(f"输入路径 {input_path} 不存在")
+            return []
+        if os.path.isfile(input_path):
+            if input_path.lower().endswith(".srt") and "简体中文" not in input_path:
+                srt_files.append(input_path)
+        elif os.path.isdir(input_path):
+            for root, dirs, files in os.walk(input_path):
+                for file in files:
+                    if file.endswith(".srt") and "简体中文" not in file:
+                        full_path = os.path.join(root, file)
+                        srt_files.append(os.path.abspath(full_path))
+        return srt_files
+
     parser = argparse.ArgumentParser(description="LLM Subtitle Translator--by liug")
     parser.add_argument("-i", "--input", required=True, help="输入 SRT 文件路径")
     parser.add_argument("-o", "--output", help="输出文件路径")
@@ -418,11 +440,15 @@ def main():
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
 
-    try:
-        asr_data = ASRData.from_srt(args.input)
-    except Exception as e:
-        print(f"[-] 读取输入文件失败: {e}")
+    # 获取srt文件列表
+    srt_files = find_srt_files(args.input)
+    if not srt_files:
+        print(f"[-] 输入路径 {args.input} 不包含任何 SRT 文件")
         sys.exit(1)
+    else:
+        print(f"[*] 找到 {len(srt_files)} 个 SRT 文件:")
+        for i, srt_file in enumerate(srt_files, 1):
+            print(f"    {i}. {srt_file}")
 
     translator = LLMTranslator(
         api_config=config['api'],
@@ -438,36 +464,49 @@ def main():
     )
 
     print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num} | 块大小: {translator.batch_num} | API超时: {translator.timeout}s")
-    
-    try:
-        translated_data = translator.translate(asr_data)
-        
-        output_format = args.format
-        if args.output:
-            if os.path.isdir(args.output): # 如果是目录
-                # 获取输入文件的基本名称（不含路径和后缀）
-                input_filename = os.path.basename(args.input)
-                name_without_ext = os.path.splitext(input_filename)[0]
-                # 在该目录下拼接新文件名，默认用 srt（或根据需求改）
-                output_file = os.path.join(args.output, f"{name_without_ext}.{args.lang}.{output_format}")
-            else:  # 否则是一个具体的文件路径
-                output_file = args.output
-                output_format = 'ass' if args.output.lower().endswith('.ass') else 'srt'
-        else:
-            output_file = args.input.replace(".srt", f".{args.lang}.{output_format}")
+    print("="*80)
 
-        if output_format == 'ass':
-            translated_data.to_ass(output_file, bilingual=args.bilingual)
-        else:
-            translated_data.to_srt(output_file, bilingual=args.bilingual)
+    for i,srt_file in enumerate(srt_files, 1):
+        translator.write(f"[*] 正在处理文件 {i}/{len(srt_files)}: {srt_file}")
+        try:
+            asr_data = ASRData.from_srt(srt_file)
+        except Exception as e:
+            translator.write(f"[-] 读取输入文件失败: {e}")
+            continue
+
+        try:
+            translated_data = translator.translate(asr_data)
             
-        print(f"\n[+] 翻译成功！保存至: {output_file}")
-    except Exception as e:
-        # 这里的异常捕获主要是针对 translate() 函数内部未处理的致命错误
-        print(f"\n[-] 翻译过程中出现未预期异常: {e}")
-        sys.exit(1)
-    finally:
-        translator.stop()
+            output_format = args.format
+            if args.output:
+                if os.path.isdir(args.output): # 如果是目录
+                    # 获取输入文件的基本名称（不含路径和后缀）
+                    input_filename = os.path.basename(srt_file)
+                    name_without_ext = os.path.splitext(input_filename)[0]
+                    # 在该目录下拼接新文件名，默认用 srt（或根据需求改）
+                    output_file = os.path.join(args.output, f"{name_without_ext}.{args.lang}.{output_format}")
+                else:  # 否则是一个具体的文件路径
+                    output_file = args.output
+                    output_format = 'ass' if args.output.lower().endswith('.ass') else 'srt'
+            else:
+                output_file = srt_file.replace(".srt", f".{args.lang}.{output_format}")
+
+            if output_format == 'ass':
+                translated_data.to_ass(output_file, bilingual=args.bilingual)
+            else:
+                translated_data.to_srt(output_file, bilingual=args.bilingual)
+                
+            translator.write(f"\n[+] 翻译成功！保存至: {output_file}")
+            translator.write("="*80)
+            translator.write("")
+        except Exception as e:
+            # 这里的异常捕获主要是针对 translate() 函数内部未处理的致命错误
+            translator.write(f"\n[-] 翻译过程中出现未预期异常: {e}")
+            continue
+
+    translator.stop()
+    print("="*80)
+    print("\n[*] 所有任务已完成！")
 
 if __name__ == "__main__":
     main()
