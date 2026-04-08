@@ -414,96 +414,111 @@ def main():
     parser.add_argument("-s", "--source", default="Japanese", help="源语言")
     parser.add_argument("-l", "--lang", default="简体中文", help="目标语言")
     parser.add_argument("-c", "--config", default="config.yaml", help="配置文件路径")
+    parser.add_argument("-a", "--api", help="指定使用的 API 名称 (对应 config.yaml 中的 apis 键名)") # 新增参数
     parser.add_argument("--format", choices=['srt', 'ass'], default='srt', help="输出格式")
     parser.add_argument("--reflect", action="store_true", help="开启反思模式")
     parser.add_argument("--bilingual", action="store_true", help="输出双语对照")
     
     args = parser.parse_args()
+    # 获取翻译的提示词
     PROMPTS = {k: v for k, v in vars(prompts).items() if not k.startswith("__")}
 
-    if not os.path.exists(args.config):
-        config = {
-            "api": {"api_key": "YOUR_API_KEY", "base_url": "https://api.openai.com/v1", "model": "gpt-4o"},
-            "settings": {
-                "thread_num": 4, 
-                "batch_num": 80, 
-                "cache_dir": "./.cache_sub_trans", 
-                "temperature": 0.6,
-                "timeout": 60 # 新增 TIMEOUT 参数
-            }
-        }
-        with open(args.config, 'w', encoding='utf-8') as f:
-            yaml.dump(config, f, allow_unicode=True)
-        print(f"[*] 已生成默认配置文件 {args.config}，请修改后运行。")
-        sys.exit(0) # 生成配置后退出
-
-    with open(args.config, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-
-    # 获取srt文件列表
+    # 1. 获取 srt 文件列表
     srt_files = find_srt_files(args.input)
     if not srt_files:
         print(f"[-] 输入路径 {args.input} 不包含任何 SRT 文件")
         sys.exit(1)
     else:
-        print(f"[*] 找到 {len(srt_files)} 个 SRT 文件:")
-        for i, srt_file in enumerate(srt_files, 1):
-            print(f"    {i}. {srt_file}")
+        print(f"[*] 找到 {len(srt_files)} 个 SRT 文件")
 
+
+    # 2. 检查并加载配置文件
+    if not os.path.exists(args.config):
+        # 默认生成新结构的配置
+        default_config = {
+            "apis": {
+                "openai": {"api_key": "YOUR_API_KEY", "base_url": "https://api.openai.com/v1", "model": "gpt-4o"},
+                "gemini": {"api_key": "YOUR_API_KEY", "base_url": "https://kaka.liugngg.top/v1", "model": "gemini-1.5-flash"}
+            },
+            "default_api": "openai",
+            "settings": {
+                "thread_num": 4, 
+                "batch_num": 40, 
+                "cache_dir": "./.cache_sub_trans", 
+                "temperature": 0.7,
+                "timeout": 30 
+            }
+        }
+        with open(args.config, 'w', encoding='utf-8') as f:
+            yaml.dump(default_config, f, allow_unicode=True)
+        print(f"[*] 已生成默认配置文件 {args.config}，请修改后运行。")
+        sys.exit(0)
+    with open(args.config, 'r', encoding='utf-8') as f:
+        config = yaml.safe_load(f)
+
+    # 3. 确定使用哪一个 API 配置
+    available_apis = config.get('apis', {})
+    if not available_apis:
+        print("[-] 错误：配置文件中没有找到 'apis' 配置项。")
+        sys.exit(1)
+    # 优先级：命令行参数 > 配置文件中的 default_api > 第一个可用的 API
+    api_name = args.api or config.get('default_api')
+    if not api_name or api_name not in available_apis:
+        if args.api:
+            print(f"[-] 错误：指定的 API '{args.api}' 不在配置文件中。")
+            print(f"[*] 可用的 API 有: {', '.join(available_apis.keys())}")
+            sys.exit(1)
+        else:
+            api_name = list(available_apis.keys())[0]
+            print(f"[*] 未指定 API 且无默认设置，自动选择第一个: {api_name}")
+    selected_api_config = available_apis[api_name]
+    print(f"[*] 已选择 API 配置: [{api_name}] (Model: {selected_api_config.get('model')})")
+    
+
+    # 4. 初始化翻译器 (传入 selected_api_config)
     translator = LLMTranslator(
-        api_config=config['api'],
+        api_config=selected_api_config,
         prompts=PROMPTS,
         thread_num=config['settings'].get('thread_num', 4),
-        batch_num=config['settings'].get('batch_num', 80),
+        batch_num=config['settings'].get('batch_num', 40),
         source_lang=args.source,
         target_lang=args.lang,
         cache_dir=config['settings'].get('cache_dir', './.cache_sub_trans'),
         is_reflect=args.reflect,
-        temperature=config['settings'].get('temperature', 0.6),
-        timeout=config['settings'].get('timeout', 20) # 传入 timeout 参数
+        temperature=config['settings'].get('temperature', 0.7),
+        timeout=config['settings'].get('timeout', 30)
     )
 
-    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num} | 块大小: {translator.batch_num} | API超时: {translator.timeout}s")
+    # 开始翻译：
+    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num}")
     print("="*80)
-
-    for i,srt_file in enumerate(srt_files, 1):
+    for i, srt_file in enumerate(srt_files, 1):
+        # ... (循环内部逻辑保持不变)
         translator.write(f"[*] 正在处理文件 {i}/{len(srt_files)}: {srt_file}")
         try:
             asr_data = ASRData.from_srt(srt_file)
-        except Exception as e:
-            translator.write(f"[-] 读取输入文件失败: {e}")
-            continue
-
-        try:
             translated_data = translator.translate(asr_data)
             
+            # ... (保存逻辑)
             output_format = args.format
             if args.output:
-                if os.path.isdir(args.output): # 如果是目录
-                    # 获取输入文件的基本名称（不含路径和后缀）
+                if os.path.isdir(args.output):
                     input_filename = os.path.basename(srt_file)
                     name_without_ext = os.path.splitext(input_filename)[0]
-                    # 在该目录下拼接新文件名，默认用 srt（或根据需求改）
                     output_file = os.path.join(args.output, f"{name_without_ext}.{args.lang}.{output_format}")
-                else:  # 否则是一个具体的文件路径
+                else:
                     output_file = args.output
                     output_format = 'ass' if args.output.lower().endswith('.ass') else 'srt'
             else:
                 output_file = srt_file.replace(".srt", f".{args.lang}.{output_format}")
-
             if output_format == 'ass':
                 translated_data.to_ass(output_file, bilingual=args.bilingual)
             else:
                 translated_data.to_srt(output_file, bilingual=args.bilingual)
-                
             translator.write(f"\n[+] 翻译成功！保存至: {output_file}")
-            translator.write("="*80)
-            translator.write("")
         except Exception as e:
-            # 这里的异常捕获主要是针对 translate() 函数内部未处理的致命错误
             translator.write(f"\n[-] 翻译过程中出现未预期异常: {e}")
             continue
-
     translator.stop()
     print("="*80)
     print("\n[*] 所有任务已完成！")
