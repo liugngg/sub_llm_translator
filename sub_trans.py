@@ -47,7 +47,7 @@ BLANK_HEAD_RE = re.compile(r'^[^\w(（\[「【\'"‘“-]+', flags=re.UNICODE|re
 REPEAT_CONTENT_RE = re.compile(r'(.{2,})([\s,.!?;，。！？；]+)\1', flags=re.UNICODE|re.MULTILINE)
 
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
-BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔んっはいふぁっあうちゅちあたえ]*$', flags=re.UNICODE|re.MULTILINE)
+BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔んっはいふぁっあうちゅちあたえ]*$', flags=re.UNICODE|re.MULTILINE)
 ###############################################################
 
 # ==========================================
@@ -171,7 +171,7 @@ class BaseTranslator(ABC):
         
         chunks = [translate_data_list[i:i + self.batch_num] for i in range(0, len(translate_data_list), self.batch_num)]
         translated_map = {}
-        
+        print(f"[*] 分组数量: {len(chunks)}")
         self.pbar = tqdm(total=len(chunks), desc="[*] 翻译进度", unit="chunk")
         
         futures = {self.executor.submit(self._process_chunk_with_retry, chunk): chunk for chunk in chunks}
@@ -263,7 +263,9 @@ class LLMTranslator(BaseTranslator):
         
         super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir, timeout)
         # 设置LLM API接口
-        self.client = OpenAI(api_key=api_config['api_key'], base_url=api_config['base_url'])
+        base_url = api_config.get('base_url')
+        url =f"{base_url.rstrip('/').rstrip('/v1')}/v1"
+        self.client = OpenAI(api_key=api_config['api_key'], base_url=url)
         self.model = api_config['model']
         self.prompts = prompts
         self.is_reflect = is_reflect
@@ -490,7 +492,7 @@ def main():
     )
 
     # 开始翻译：
-    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num}")
+    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num} | 单批数量: {translator.batch_num} | 温度: {translator.temperature}")
     print("="*80)
     for i, srt_file in enumerate(srt_files, 1):
         # ... (循环内部逻辑保持不变)
@@ -519,6 +521,8 @@ def main():
         except Exception as e:
             translator.write(f"\n[-] 翻译过程中出现未预期异常: {e}")
             continue
+        print("="*80)
+        print("")
     translator.stop()
     print("="*80)
     print("\n[*] 所有任务已完成！")
