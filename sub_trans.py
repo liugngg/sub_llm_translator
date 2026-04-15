@@ -5,6 +5,7 @@ import hashlib
 import argparse
 import re
 import time
+from datetime import timedelta
 import atexit
 import sys # 导入 sys 模块用于程序退出
 from abc import ABC, abstractmethod
@@ -12,7 +13,6 @@ from typing import List, Dict, Any, Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict
 
-import openai
 from openai import OpenAI, RateLimitError, AuthenticationError, NotFoundError, APITimeoutError # 导入更具体的异常
 import json_repair
 from diskcache import Cache
@@ -47,8 +47,12 @@ BLANK_HEAD_RE = re.compile(r'^[^\w(（\[「【\'"‘“-]+', flags=re.UNICODE|re
 REPEAT_CONTENT_RE = re.compile(r'(.{2,})([\s,.!?;，。！？；]+)\1', flags=re.UNICODE|re.MULTILINE)
 
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
-BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔んっはいふぁっあうちゅちあたえ]*$', flags=re.UNICODE|re.MULTILINE)
+BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔ぁあいうえおかきくしゃちゅっなはまゃゅわー]*$', flags=re.UNICODE|re.MULTILINE)
 ###############################################################
+# 合并字幕的最小时间间隔和最大时长（秒）：
+MERGE_TIME_INTERVAL = 0.5
+MAX_SUB_DURATION = 8
+
 
 # ==========================================
 # 1. 基础数据结构 (Entities)
@@ -63,10 +67,10 @@ class SubtitleProcessData:
 # ASRDataSeg and ASRData 类保持逻辑不变，仅确保 clean_line 等方法正常工作
 class ASRDataSeg:
     def __init__(self, text: str, start_time: str, end_time: str, index: int, translated_text: str = ""):
-        self.text = text
+        self.index = index
         self.start_time = start_time
         self.end_time = end_time
-        self.index = index
+        self.text = text
         self.translated_text = translated_text
 
 class ASRData:
@@ -84,6 +88,26 @@ class ASRData:
         # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
         text = BLANK_RE.sub(r'', text)
         return text.strip()
+    @staticmethod
+    def time_to_seconds(t_str):
+        """将 SRT 时间字符串 HH:MM:SS,mmm 转换为秒(float)"""
+        hh, mm, ss_ms = t_str.split(':')
+        ss, ms = ss_ms.split(',')
+        return int(hh) * 3600 + int(mm) * 60 + int(ss) + int(ms) / 1000.0
+    
+    @staticmethod    
+    def seconds_to_time(seconds):
+        """将秒转换为 SRT 时间字符串 HH:MM:SS,mmm"""
+        td = timedelta(seconds=seconds)
+        total_seconds = int(td.total_seconds())
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        millis = int(round((td.total_seconds() - total_seconds) * 1000))
+        if millis == 1000: # 处理舍入进位
+            secs += 1
+            millis = 0
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
     @staticmethod
     def from_srt(file_path: str) -> "ASRData":
@@ -98,6 +122,64 @@ class ASRData:
             if text:
                 segments.append(ASRDataSeg(text, times[0], times[1], idx))
         return ASRData(segments)
+    
+    def srt_clean(self, translated_text: bool=False):
+        """
+        清理字幕：
+        1. 去掉开头的标点符号和空白符
+        2. 将文本中重复了2次及以上的多字字符串替换为1次
+        3. 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
+        """
+        clenaned_segments = []
+        for segment in self.segments:
+            if translated_text:
+                segment.translated_text = self.clean_line(segment.translated_text)
+                if segment.translated_text:
+                    clenaned_segments.append(segment)
+            else:
+                segment.text = self.clean_line(segment.text)
+                if segment.text:
+                    clenaned_segments.append(segment)
+        self.segments = clenaned_segments
+    
+    def srt_merge(self, S: float=MERGE_TIME_INTERVAL, D: float=MAX_SUB_DURATION):
+        """
+        合并字幕：如果字幕文字一样，同时时间间隔小于(S)的则合并。同时将字幕中时长超过(D)的调整时长为(D)。
+        """
+        if not self.segments:
+            return
+        processed_segments: List[ASRDataSeg] = []
+        for current in self.segments:
+            # 转换当前时间为秒以便计算
+            curr_start_s = self.time_to_seconds(current.start_time)
+            curr_end_s = self.time_to_seconds(current.end_time)
+            # 逻辑 2: 检查最大持续时长 D
+            if (curr_end_s - curr_start_s) > D:
+                curr_end_s = curr_start_s + D
+                current.end_time = self.seconds_to_time(curr_end_s)
+            if not processed_segments:
+                processed_segments.append(current)
+                continue
+            prev = processed_segments[-1]
+            prev_start_s = self.time_to_seconds(prev.start_time)
+            prev_end_s = self.time_to_seconds(prev.end_time)
+            
+            gap = curr_start_s - prev_end_s
+            # 逻辑 1: 相同内容且间隔小于 S，进行合并
+            if current.text == prev.text and gap < S:
+                # 修改前一条的结束时间为当前条的结束时间
+                # 注意：这里 curr_end_s 已经是经过 D 限制处理过的值
+                new_end_s = curr_end_s
+                
+                # 再次检查合并后的总时长是否超过 D
+                if (new_end_s - prev_start_s) > D:
+                    new_end_s = prev_start_s + D
+                
+                prev.end_time = self.seconds_to_time(new_end_s)
+            else:
+                processed_segments.append(current)
+        # 3. 输出结果：
+        self.segments = processed_segments
 
     def _srt_to_ass_time(self, srt_time: str) -> str:
         t = srt_time.replace(',', '.')
@@ -109,24 +191,26 @@ class ASRData:
         return t
 
     def to_srt(self, output_path: str, bilingual: bool = False):
-        with open(output_path, 'w', encoding='utf-8') as f:
-            for seg in self.segments:
-                f.write(f"{seg.index}\n{seg.start_time} --> {seg.end_time}\n")
-                src = ASRData.clean_line(seg.text)
-                translated = ASRData.clean_line(seg.translated_text)
-                if not translated: continue
-                if bilingual: f.write(f"{translated}\n{src}\n\n")
-                else: f.write(f"{translated}\n\n")
+        # 输出srt字幕之前，先进行字幕清理和合并：
+        self.srt_merge()
+        self.srt_clean(translated_text=True)
+        # 输出srt字幕
+        with open(output_path, 'w', encoding='utf-8-sig') as f:
+            for i, seg in enumerate(self.segments, 1):
+                f.write(f"{i}\n{seg.start_time} --> {seg.end_time}\n")
+                if bilingual: f.write(f"{seg.translated_text}\n{seg.text}\n\n")
+                else: f.write(f"{seg.translated_text}\n\n")
 
     def to_ass(self, output_path: str, bilingual: bool = False):
+        # 输出srt字幕之前，先进行字幕清理和合并：
+        self.srt_merge()
+        self.srt_clean(translated_text=True)
         with open(output_path, 'w', encoding='utf-8-sig') as f:
             f.write(ass_header + "\n")
             for seg in self.segments:
                 start = self._srt_to_ass_time(seg.start_time)
                 end = self._srt_to_ass_time(seg.end_time)
-                translated = ASRData.clean_line(seg.translated_text)
-                if not translated: continue
-                text = f"{translated}\\N{seg.text}" if bilingual else translated
+                text = f"{seg.translated_text}\\N{seg.text}" if bilingual else seg.translated_text
                 text = text.replace('\n', '\\N')
                 f.write(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}\n")
 
@@ -499,6 +583,8 @@ def main():
         translator.write(f"[*] 正在处理文件 {i}/{len(srt_files)}: {srt_file}")
         try:
             asr_data = ASRData.from_srt(srt_file)
+            asr_data.srt_merge()
+            asr_data.srt_clean            
             translated_data = translator.translate(asr_data)
             
             # ... (保存逻辑)
