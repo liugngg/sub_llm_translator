@@ -49,9 +49,6 @@ REPEAT_CONTENT_RE = re.compile(r'(.{2,})([\s,.!?;，。！？；]+)\1', flags=re
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
 BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔ぁあいうえおかきくしゃちゅっなはまゃゅわー]*$', flags=re.UNICODE|re.MULTILINE)
 ###############################################################
-# 合并字幕的最小时间间隔和最大时长（秒）：
-MERGE_TIME_INTERVAL = 0.5
-MAX_SUB_DURATION = 8
 
 
 # ==========================================
@@ -76,9 +73,12 @@ class ASRDataSeg:
 class ASRData:
     def __init__(self, segments: List[ASRDataSeg]):
         self.segments = sorted(segments, key=lambda x: x.index)
+        # 默认合并间隔为0.7秒,最大时长为8秒
+        self.merge_interval = 0.7
+        self.max_duration = 8
+        self.replace_dic = {}
 
-    @staticmethod
-    def clean_line(text: str) -> str:
+    def clean_line(self, text: str) -> str:
         text = text.strip()
         if not text: return ''
         # 将文本中重复了2次及以上的多字字符串替换为1次
@@ -87,6 +87,17 @@ class ASRData:
         text = BLANK_HEAD_RE.sub(r'', text)
         # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
         text = BLANK_RE.sub(r'', text)
+        # 替换和删除特定词语（支持正则表达式)
+        if self.replace_dic:
+            for old_wd, new_wd in self.replace_dic.items():
+                try:
+                    text = re.sub(old_wd, new_wd, text, flags=re.UNICODE)
+                    # print (f"[*]替换'{old_wd}'为'{new_wd}'")
+                except re.error as e:
+                    print(f"[*]'{old_wd}'正则表达式语法错误: {e}")
+                    continue
+                except Exception as e:
+                    continue
         return text.strip()
     @staticmethod
     def time_to_seconds(t_str):
@@ -118,9 +129,8 @@ class ASRData:
         for match in pattern.finditer(content):
             idx = int(match.group(1))
             times = match.group(2).split(' --> ')
-            text = ASRData.clean_line(match.group(3))
-            if text:
-                segments.append(ASRDataSeg(text, times[0], times[1], idx))
+            text = match.group(3)
+            segments.append(ASRDataSeg(text, times[0], times[1], idx))
         return ASRData(segments)
     
     def srt_clean(self, translated_text: bool=False):
@@ -142,13 +152,15 @@ class ASRData:
                     clenaned_segments.append(segment)
         self.segments = clenaned_segments
     
-    def srt_merge(self, S: float=MERGE_TIME_INTERVAL, D: float=MAX_SUB_DURATION):
+    def srt_merge(self):
         """
         合并字幕：如果字幕文字一样，同时时间间隔小于(S)的则合并。同时将字幕中时长超过(D)的调整时长为(D)。
         """
         if not self.segments:
             return
         processed_segments: List[ASRDataSeg] = []
+        S = self.merge_interval
+        D = self.max_duration
         for current in self.segments:
             # 转换当前时间为秒以便计算
             curr_start_s = self.time_to_seconds(current.start_time)
@@ -532,7 +544,9 @@ def main():
                 "batch_num": 40, 
                 "cache_dir": "./.cache_sub_trans", 
                 "temperature": 0.7,
-                "timeout": 30 
+                "timeout": 30,
+                "merge_interval": 0.7,  
+                "max_duration": 8
             }
         }
         with open(args.config, 'w', encoding='utf-8') as f:
@@ -560,7 +574,6 @@ def main():
     selected_api_config = available_apis[api_name]
     print(f"[*] 已选择 API 配置: [{api_name}] (Model: {selected_api_config.get('model')})")
     
-
     # 4. 初始化翻译器 (传入 selected_api_config)
     translator = LLMTranslator(
         api_config=selected_api_config,
@@ -580,9 +593,14 @@ def main():
     print("="*80)
     for i, srt_file in enumerate(srt_files, 1):
         # ... (循环内部逻辑保持不变)
-        translator.write(f"[*] 正在处理文件 {i}/{len(srt_files)}: {srt_file}")
+        translator.write("")
+        translator.write(f"[*] 正在处理文件[{i}/{len(srt_files)}]: {srt_file}")
         try:
             asr_data = ASRData.from_srt(srt_file)
+            # 获取字幕合并重复项的设置
+            asr_data.merge_interval = config['settings'].get('merge_interval', 0.7)
+            asr_data.max_duration = config['settings'].get('max_duration', 8)
+            asr_data.replace_dic = config.get('replacements', {})
             asr_data.srt_merge()
             asr_data.srt_clean            
             translated_data = translator.translate(asr_data)
@@ -603,15 +621,15 @@ def main():
                 translated_data.to_ass(output_file, bilingual=args.bilingual)
             else:
                 translated_data.to_srt(output_file, bilingual=args.bilingual)
-            translator.write(f"\n[+] 翻译成功！保存至: {output_file}")
+            translator.write(f"\n[+] 文件[{i}/{len(srt_files)}]:翻译成功！保存至: {output_file}")
         except Exception as e:
-            translator.write(f"\n[-] 翻译过程中出现未预期异常: {e}")
+            translator.write(f"\n[-] 翻译过程中出现异常: {e}")
             continue
         print("="*80)
         print("")
     translator.stop()
     print("="*80)
-    print("\n[*] 所有任务已完成！")
+    print("\n[*] 全部翻译任务已完成！")
 
 if __name__ == "__main__":
     main()

@@ -8,6 +8,7 @@ wheels/
 config*
 .cache*/
 test/
+config.*
 
 # Virtual environments
 .venv
