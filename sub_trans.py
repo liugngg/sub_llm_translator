@@ -141,14 +141,19 @@ class ASRData:
         3. 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
         """
         clenaned_segments = []
+        i = 0
         for segment in self.segments:
             if translated_text:
                 segment.translated_text = self.clean_line(segment.translated_text)
                 if segment.translated_text:
+                    i = i + 1
+                    segment.index = i
                     clenaned_segments.append(segment)
             else:
                 segment.text = self.clean_line(segment.text)
                 if segment.text:
+                    i = i + 1
+                    segment.index = i
                     clenaned_segments.append(segment)
         self.segments = clenaned_segments
     
@@ -159,6 +164,7 @@ class ASRData:
         if not self.segments:
             return
         processed_segments: List[ASRDataSeg] = []
+        i = 0
         S = self.merge_interval
         D = self.max_duration
         for current in self.segments:
@@ -170,6 +176,8 @@ class ASRData:
                 curr_end_s = curr_start_s + D
                 current.end_time = self.seconds_to_time(curr_end_s)
             if not processed_segments:
+                i = i + 1
+                current.index = i
                 processed_segments.append(current)
                 continue
             prev = processed_segments[-1]
@@ -189,6 +197,8 @@ class ASRData:
                 
                 prev.end_time = self.seconds_to_time(new_end_s)
             else:
+                i = i + 1
+                current.index = i
                 processed_segments.append(current)
         # 3. 输出结果：
         self.segments = processed_segments
@@ -466,11 +476,11 @@ class LLMTranslator(BaseTranslator):
             return False, f"返回结果缺少以下键: {missing}"
         
         # 确保返回的字典没有多余的键 (可选，但有助于更严格的结构检查)
-        if not resp_keys.issubset(origin_keys):
-            extra = resp_keys - origin_keys
-            # 这里可以根据需要决定是返回 False 还是仅发出警告。
-            # 为了更严格，我们视为错误。
-            return False, f"返回结果包含不应存在的额外键: {extra}"
+        # if not resp_keys.issubset(origin_keys):
+        #     extra = resp_keys - origin_keys
+        #     # 这里可以根据需要决定是返回 False 还是仅发出警告。
+        #     # 为了更严格，我们视为错误。
+        #     return False, f"返回结果包含不应存在的额外键: {extra}"
 
         if self.is_reflect:
             for k in origin_keys:
@@ -602,7 +612,7 @@ def main():
             asr_data.max_duration = config['settings'].get('max_duration', 8)
             asr_data.replace_dic = config.get('replacements', {})
             asr_data.srt_merge()
-            asr_data.srt_clean            
+            asr_data.srt_clean()            
             translated_data = translator.translate(asr_data)
             
             # ... (保存逻辑)
@@ -628,8 +638,8 @@ def main():
         print("="*80)
         print("")
     translator.stop()
-    print("="*80)
-    print("\n[*] 全部翻译任务已完成！")
+    # print("="*80)
+    # print("\n[*] 全部翻译任务已完成！")
 
 if __name__ == "__main__":
     main()
