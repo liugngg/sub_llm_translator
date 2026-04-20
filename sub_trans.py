@@ -32,7 +32,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Microsoft YaHei,60,&H0000FFFF,&H000000FF,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+Style: Default,Microsoft YaHei,60,&H0000FFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
@@ -81,6 +81,8 @@ class ASRData:
     def clean_line(self, text: str) -> str:
         text = text.strip()
         if not text: return ''
+        # print (f"[*]原始字幕行: {text}")
+
         # 将文本中重复了2次及以上的多字字符串替换为1次
         text = REPEAT_CONTENT_RE.sub(r'\1', text)
         # 去掉开头的标点符号和空白符
@@ -98,6 +100,7 @@ class ASRData:
                     continue
                 except Exception as e:
                     continue
+        # print (f"[*]清理后字幕行: {text}")
         return text.strip()
     @staticmethod
     def time_to_seconds(t_str):
@@ -156,6 +159,10 @@ class ASRData:
                     segment.index = i
                     clenaned_segments.append(segment)
         self.segments = clenaned_segments
+        # if translated_text:
+        #     print (f"[*]已清理翻译后的字幕。")
+        # else:
+        #     print (f"[*]已清理原始字幕。")
     
     def srt_merge(self):
         """
@@ -167,6 +174,7 @@ class ASRData:
         i = 0
         S = self.merge_interval
         D = self.max_duration
+        numbers_before = len(self.segments)
         for current in self.segments:
             # 转换当前时间为秒以便计算
             curr_start_s = self.time_to_seconds(current.start_time)
@@ -202,6 +210,7 @@ class ASRData:
                 processed_segments.append(current)
         # 3. 输出结果：
         self.segments = processed_segments
+        print(f"[*] 字幕合并前/后数量:  {numbers_before}/{len(self.segments)}")
 
     def _srt_to_ass_time(self, srt_time: str) -> str:
         t = srt_time.replace(',', '.')
@@ -214,6 +223,7 @@ class ASRData:
 
     def to_srt(self, output_path: str, bilingual: bool = False):
         # 输出srt字幕之前，先进行字幕清理和合并：
+        self.srt_clean(translated_text=True)
         self.srt_merge()
         self.srt_clean(translated_text=True)
         # 输出srt字幕
@@ -225,6 +235,7 @@ class ASRData:
 
     def to_ass(self, output_path: str, bilingual: bool = False):
         # 输出srt字幕之前，先进行字幕清理和合并：
+        self.srt_clean(translated_text=True)
         self.srt_merge()
         self.srt_clean(translated_text=True)
         with open(output_path, 'w', encoding='utf-8-sig') as f:
@@ -611,6 +622,7 @@ def main():
             asr_data.merge_interval = config['settings'].get('merge_interval', 0.7)
             asr_data.max_duration = config['settings'].get('max_duration', 8)
             asr_data.replace_dic = config.get('replacements', {})
+            asr_data.srt_clean()
             asr_data.srt_merge()
             asr_data.srt_clean()            
             translated_data = translator.translate(asr_data)
