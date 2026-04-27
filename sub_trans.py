@@ -44,7 +44,7 @@ BLANK_HEAD_RE = re.compile(r'^[^\w(（\[「【\'"‘“-]+', flags=re.UNICODE|re
 # text = re.sub(r'^[\W]+', '', text, flags=re.UNICODE)
 
 # 将文本中重复了2次及以上的多字字符串替换为1次
-REPEAT_CONTENT_RE = re.compile(r'(.{2,})([\s,.!?;，。！？；]+)\1', flags=re.UNICODE|re.MULTILINE)
+REPEAT_CONTENT_RE = re.compile(r'(.+?)([\s,.!?;，。！？；]*)\1+', flags=re.UNICODE|re.MULTILINE)
 
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
 BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔ぁあいうえおかきくしゃちゅっなはまゃゅわー]*$', flags=re.UNICODE|re.MULTILINE)
@@ -101,6 +101,8 @@ class ASRData:
                 except Exception as e:
                     continue
         # print (f"[*]清理后字幕行: {text}")
+        # 最后再执行一次重复内容的替换
+        text = REPEAT_CONTENT_RE.sub(r'\1', text)
         return text.strip()
     @staticmethod
     def time_to_seconds(t_str):
@@ -638,7 +640,10 @@ def main():
                     output_file = args.output
                     output_format = 'ass' if args.output.lower().endswith('.ass') else 'srt'
             else:
-                output_file = srt_file.replace(".srt", f".{args.lang}.{output_format}")
+                if output_format == 'ass':
+                    output_file = srt_file.replace(".srt", ".ass")
+                else:
+                    output_file = srt_file.replace(".srt", f".{args.lang}.srt")
             if output_format == 'ass':
                 translated_data.to_ass(output_file, bilingual=args.bilingual)
             else:
