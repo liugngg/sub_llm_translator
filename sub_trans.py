@@ -44,7 +44,7 @@ BLANK_HEAD_RE = re.compile(r'^[^\w(（\[「【\'"‘“-]+', flags=re.UNICODE|re
 # text = re.sub(r'^[\W]+', '', text, flags=re.UNICODE)
 
 # 将文本中重复了2次及以上的多字字符串替换为1次
-REPEAT_CONTENT_RE = re.compile(r'(.+?)([\s,.!?;，。！？；]*)\1+', flags=re.UNICODE|re.MULTILINE)
+REPEAT_CONTENT_RE = re.compile(r'(.{2,}?)([\s,.!?;，。！？；]*)\1+', flags=re.UNICODE|re.MULTILINE)
 
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
 BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔ぁあいうえおかきくしゃちゅっなはまゃゅわー]*$', flags=re.UNICODE|re.MULTILINE)
