@@ -7,7 +7,9 @@ wheels/
 *.egg-info
 config*
 .cache*/
-test/
+test/*
+!test/
+!test/*.py
 config.*
 
 # Virtual environments

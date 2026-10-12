@@ -47,7 +47,7 @@ BLANK_HEAD_RE = re.compile(r'^[^\w(（\[「【\'"‘“-]+', flags=re.UNICODE|re
 REPEAT_CONTENT_RE = re.compile(r'(.{2,}?)([\s,.!?;，。！？；]*)\1+', flags=re.UNICODE|re.MULTILINE)
 
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
-BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔ぁあいうえおかきくしゃちゅっなはまゃゅわー]*$', flags=re.UNICODE|re.MULTILINE)
+BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔]*$', flags=re.UNICODE|re.MULTILINE)
 ###############################################################
 
 
@@ -114,15 +114,10 @@ class ASRData:
     @staticmethod    
     def seconds_to_time(seconds):
         """将秒转换为 SRT 时间字符串 HH:MM:SS,mmm"""
-        td = timedelta(seconds=seconds)
-        total_seconds = int(td.total_seconds())
-        hours = total_seconds // 3600
-        minutes = (total_seconds % 3600) // 60
-        secs = total_seconds % 60
-        millis = int(round((td.total_seconds() - total_seconds) * 1000))
-        if millis == 1000: # 处理舍入进位
-            secs += 1
-            millis = 0
+        total_millis = round(seconds * 1000)
+        hours, remainder = divmod(total_millis, 3_600_000)
+        minutes, remainder = divmod(remainder, 60_000)
+        secs, millis = divmod(remainder, 1000)
         return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
     @staticmethod
@@ -150,10 +145,12 @@ class ASRData:
         for segment in self.segments:
             if translated_text:
                 segment.translated_text = self.clean_line(segment.translated_text)
-                if segment.translated_text:
-                    i = i + 1
-                    segment.index = i
-                    clenaned_segments.append(segment)
+                # Empty translations fall back to the source so exports never lose dialogue.
+                if not segment.translated_text:
+                    segment.translated_text = segment.text
+                i = i + 1
+                segment.index = i
+                clenaned_segments.append(segment)
             else:
                 segment.text = self.clean_line(segment.text)
                 if segment.text:
@@ -166,7 +163,7 @@ class ASRData:
         # else:
         #     print (f"[*]已清理原始字幕。")
     
-    def srt_merge(self):
+    def srt_merge(self, translated_text: bool = False):
         """
         合并字幕：如果字幕文字一样，同时时间间隔小于(S)的则合并。同时将字幕中时长超过(D)的调整时长为(D)。
         """
@@ -196,7 +193,9 @@ class ASRData:
             
             gap = curr_start_s - prev_end_s
             # 逻辑 1: 相同内容且间隔小于 S，进行合并
-            if current.text == prev.text and gap < S:
+            merge_text = current.translated_text if translated_text else current.text
+            previous_merge_text = prev.translated_text if translated_text else prev.text
+            if merge_text == previous_merge_text and gap >= 0 and gap < S:
                 # 修改前一条的结束时间为当前条的结束时间
                 # 注意：这里 curr_end_s 已经是经过 D 限制处理过的值
                 new_end_s = curr_end_s
@@ -206,6 +205,8 @@ class ASRData:
                     new_end_s = prev_start_s + D
                 
                 prev.end_time = self.seconds_to_time(new_end_s)
+                if translated_text and current.text != prev.text:
+                    prev.text = f"{prev.text}\n{current.text}"
             else:
                 i = i + 1
                 current.index = i
@@ -226,7 +227,7 @@ class ASRData:
     def to_srt(self, output_path: str, bilingual: bool = False):
         # 输出srt字幕之前，先进行字幕清理和合并：
         self.srt_clean(translated_text=True)
-        self.srt_merge()
+        self.srt_merge(translated_text=True)
         self.srt_clean(translated_text=True)
         # 输出srt字幕
         with open(output_path, 'w', encoding='utf-8-sig') as f:
@@ -238,7 +239,7 @@ class ASRData:
     def to_ass(self, output_path: str, bilingual: bool = False):
         # 输出srt字幕之前，先进行字幕清理和合并：
         self.srt_clean(translated_text=True)
-        self.srt_merge()
+        self.srt_merge(translated_text=True)
         self.srt_clean(translated_text=True)
         with open(output_path, 'w', encoding='utf-8-sig') as f:
             f.write(ass_header + "\n")
@@ -255,6 +256,10 @@ class ASRData:
 
 class TranslationError(Exception):
     """自定义异常，用于表示翻译过程中LLM返回结果不符合预期"""
+    pass
+
+class FatalTranslationError(TranslationError):
+    """An API/configuration failure that should not be retried."""
     pass
 
 class BaseTranslator(ABC):
@@ -304,7 +309,7 @@ class BaseTranslator(ABC):
                 # _process_chunk_with_retry 内部已经处理了重试和退出逻辑，
                 # 如果到这里抛出异常，说明是其他未知且致命的线程池错误。
                 self.write(f"\n[-] 批处理执行遇到未知致命错误: {e}")
-                sys.exit(1) # 发现严重错误则退出
+                raise TranslationError(f"批处理执行失败: {e}") from e
             finally:
                 self.pbar.update(1)
         
@@ -334,20 +339,18 @@ class BaseTranslator(ABC):
                 self.cache.set(cache_key, [asdict(d) for d in result], expire=86400 * 7)
                 return result
             
-            except (APITimeoutError, TranslationError) as e:
+            except FatalTranslationError:
+                raise
+            except (APITimeoutError, RateLimitError, TranslationError) as e:
                 if attempt < self.MAX_CHUNK_RETRIES:
                     self.write(f"\n[-] 翻译 chunk 失败 (尝试 {attempt}/{self.MAX_CHUNK_RETRIES})，错误: {e}。1秒后重试...")
                     time.sleep(1) # 等待1秒后重试
                 else:
-                    self.write(f"\n[-] 翻译 chunk 失败 (已达最大重试次数 {self.MAX_CHUNK_RETRIES})，错误: {e}。程序将退出。")
-                    self.stop()
-                    time.sleep(2)
-                    sys.exit(1) # 达到最大重试次数后退出
+                    self.write(f"\n[-] 翻译 chunk 失败 (已达最大重试次数 {self.MAX_CHUNK_RETRIES})，错误: {e}")
+                    raise TranslationError(f"chunk 重试失败: {e}") from e
             except Exception as e:
-                self.write(f"\n[-] 翻译 chunk 遇到未知错误: {e}。程序将退出。")
-                self.stop()
-                time.sleep(2)
-                sys.exit(1) # 其他意外错误，也直接退出
+                self.write(f"\n[-] 翻译 chunk 遇到未知错误: {e}")
+                raise TranslationError(f"chunk 执行失败: {e}") from e
 
         # 理论上不会执行到这里，因为达到最大重试次数会调用 sys.exit()
         return [] 
@@ -383,7 +386,13 @@ class LLMTranslator(BaseTranslator):
         super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir, timeout)
         # 设置LLM API接口
         base_url = api_config.get('base_url')
-        url =f"{base_url.rstrip('/').rstrip('/v1')}/v1"
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise ValueError("API 配置必须提供有效的 base_url")
+        url = base_url.strip().rstrip("/")
+        # OpenAI SDK expects a base URL and appends /chat/completions itself.
+        # Accept both provider roots and explicit OpenAI-compatible /v1 URLs.
+        if not url.lower().endswith("/v1"):
+            url += "/v1"
         self.client = OpenAI(api_key=api_config['api_key'], base_url=url)
         self.model = api_config['model']
         self.prompts = prompts
@@ -437,12 +446,7 @@ class LLMTranslator(BaseTranslator):
                     timeout=self.timeout # 使用配置中的 TIMEOUT
                 )
             except (AuthenticationError, NotFoundError) as e:
-                # 这些致命错误直接退出
-                self.write(f"\n[-] 发生致命错误：OpenAI API 认证/资源错误，无法继续: {e}")
-                self.stop()
-                self.write(f"\n[-] 程序正在退出。。。")
-                time.sleep(2)
-                sys.exit(1) # 致命错误，直接退出
+                raise FatalTranslationError(f"API 认证或资源错误: {e}") from e
             except (RateLimitError, APITimeoutError) as e:
                 # 这些错误向上抛出
                 raise e
@@ -524,7 +528,7 @@ def main():
         elif os.path.isdir(input_path):
             for root, dirs, files in os.walk(input_path):
                 for file in files:
-                    if file.endswith(".srt") and "简体中文" not in file:
+                    if file.lower().endswith(".srt") and "简体中文" not in file:
                         full_path = os.path.join(root, file)
                         srt_files.append(os.path.abspath(full_path))
         return srt_files
@@ -578,6 +582,8 @@ def main():
         sys.exit(0)
     with open(args.config, 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
+    if not isinstance(config, dict):
+        raise ValueError("配置文件必须是 YAML 映射")
 
     # 3. 确定使用哪一个 API 配置
     available_apis = config.get('apis', {})
@@ -598,17 +604,27 @@ def main():
     print(f"[*] 已选择 API 配置: [{api_name}] (Model: {selected_api_config.get('model')})")
     
     # 4. 初始化翻译器 (传入 selected_api_config)
+    settings = config.get('settings') if isinstance(config, dict) else None
+    if not isinstance(settings, dict):
+        raise ValueError("配置文件必须包含 settings 映射")
+    if not isinstance(selected_api_config, dict) or not all(selected_api_config.get(k) for k in ('api_key', 'base_url', 'model')):
+        raise ValueError(f"API 配置 [{api_name}] 必须包含 api_key、base_url 和 model")
+    for setting_name, minimum in (("thread_num", 1), ("batch_num", 1), ("timeout", 1)):
+        value = settings.get(setting_name, {"thread_num": 4, "batch_num": 40, "timeout": 30}[setting_name])
+        if not isinstance(value, int) or value < minimum:
+            raise ValueError(f"settings.{setting_name} 必须是大于等于 {minimum} 的整数")
+
     translator = LLMTranslator(
         api_config=selected_api_config,
         prompts=PROMPTS,
-        thread_num=config['settings'].get('thread_num', 4),
-        batch_num=config['settings'].get('batch_num', 40),
+        thread_num=settings.get('thread_num', 4),
+        batch_num=settings.get('batch_num', 40),
         source_lang=args.source,
         target_lang=args.lang,
-        cache_dir=config['settings'].get('cache_dir', './.cache_sub_trans'),
+        cache_dir=settings.get('cache_dir', './.cache_sub_trans'),
         is_reflect=args.reflect,
-        temperature=config['settings'].get('temperature', 0.7),
-        timeout=config['settings'].get('timeout', 30)
+        temperature=settings.get('temperature', 0.7),
+        timeout=settings.get('timeout', 30)
     )
 
     # 开始翻译：
@@ -621,8 +637,8 @@ def main():
         try:
             asr_data = ASRData.from_srt(srt_file)
             # 获取字幕合并重复项的设置
-            asr_data.merge_interval = config['settings'].get('merge_interval', 0.7)
-            asr_data.max_duration = config['settings'].get('max_duration', 8)
+            asr_data.merge_interval = settings.get('merge_interval', 0.7)
+            asr_data.max_duration = settings.get('max_duration', 8)
             asr_data.replace_dic = config.get('replacements', {})
             asr_data.srt_clean()
             asr_data.srt_merge()
@@ -632,18 +648,22 @@ def main():
             # ... (保存逻辑)
             output_format = args.format
             if args.output:
-                if os.path.isdir(args.output):
+                output_is_dir = os.path.isdir(args.output) or len(srt_files) > 1
+                if len(srt_files) > 1 and not output_is_dir:
+                    raise ValueError("多个输入文件时 --output 必须指定输出目录")
+                if output_is_dir:
                     input_filename = os.path.basename(srt_file)
                     name_without_ext = os.path.splitext(input_filename)[0]
                     output_file = os.path.join(args.output, f"{name_without_ext}.{args.lang}.{output_format}")
+                    os.makedirs(os.path.dirname(output_file) or args.output, exist_ok=True)
                 else:
                     output_file = args.output
                     output_format = 'ass' if args.output.lower().endswith('.ass') else 'srt'
             else:
                 if output_format == 'ass':
-                    output_file = srt_file.replace(".srt", ".ass")
+                    output_file = os.path.splitext(srt_file)[0] + ".ass"
                 else:
-                    output_file = srt_file.replace(".srt", f".{args.lang}.srt")
+                    output_file = os.path.splitext(srt_file)[0] + f".{args.lang}.srt"
             if output_format == 'ass':
                 translated_data.to_ass(output_file, bilingual=args.bilingual)
             else:
