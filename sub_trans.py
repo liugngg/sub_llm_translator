@@ -395,6 +395,9 @@ class LLMTranslator(BaseTranslator):
             url += "/v1"
         self.client = OpenAI(api_key=api_config['api_key'], base_url=url)
         self.model = api_config['model']
+        self.api_format = api_config.get('format', 'chat_completions').lower()
+        if self.api_format not in ('chat_completions', 'responses'):
+            raise ValueError("API format 必须是 chat_completions 或 responses")
         self.prompts = prompts
         self.is_reflect = is_reflect
         self.temperature = temperature
@@ -410,12 +413,16 @@ class LLMTranslator(BaseTranslator):
         subtitle_dict = {str(d.index): d.original_text for d in chunk}
         prompt_type = "reflect" if self.is_reflect else "standard"
         system_prompt = self._get_prompt(prompt_type)
+        # Responses API requires an explicit JSON instruction when using
+        # text.format.type=json_object, even if the prompt contains an example.
+        if self.api_format == 'responses' and 'json' not in system_prompt.lower():
+            system_prompt += "\nReturn only a valid JSON object."
         
         try:
             result_dict = self._agent_loop(system_prompt, subtitle_dict)
             
             for d in chunk:
-                val = result_dict.get(str(d.index), d.original_text)
+                val = result_dict[str(d.index)]
                 if self.is_reflect and isinstance(val, dict):
                     # 在反思模式下，尝试从 'native_translation' 获取，否则使用原始值
                     d.translated_text = val.get('native_translation', str(val))
@@ -438,13 +445,24 @@ class LLMTranslator(BaseTranslator):
         last_resp_dict = {}
         for step in range(self.MAX_STEPS):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    temperature=self.temperature, # 使用实例的 temperature
-                    response_format={"type": "json_object"},
-                    timeout=self.timeout # 使用配置中的 TIMEOUT
-                )
+                if self.api_format == 'responses':
+                    response = self.client.responses.create(
+                        model=self.model,
+                        input=messages,
+                        temperature=self.temperature,
+                        text={"format": {"type": "json_object"}},
+                        timeout=self.timeout
+                    )
+                    content = response.output_text
+                else:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        temperature=self.temperature,
+                        response_format={"type": "json_object"},
+                        timeout=self.timeout
+                    )
+                    content = response.choices[0].message.content
             except (AuthenticationError, NotFoundError) as e:
                 raise FatalTranslationError(f"API 认证或资源错误: {e}") from e
             except (RateLimitError, APITimeoutError) as e:
@@ -454,7 +472,8 @@ class LLMTranslator(BaseTranslator):
                 # 其他任何 OpenAI 库可能抛出的错误，视为需要重试的 TranslationError
                 raise TranslationError(f"OpenAI API 调用发生错误: {e}") from e
 
-            content = response.choices[0].message.content
+            if not content:
+                raise TranslationError("LLM 返回了空内容")
             
             try:
                 # 使用 json_repair 处理可能不完整的 JSON
@@ -509,6 +528,11 @@ class LLMTranslator(BaseTranslator):
                 v = resp_dict.get(k)
                 if not isinstance(v, str):
                     return False, f"键 '{k}' 的值不符合标准模式的要求 (需为字符串类型)"
+                # A high density of Japanese kana usually means the source was copied
+                # instead of translated. Ask the model to correct it in the agent loop.
+                kana_count = len(re.findall(r'[\u3040-\u30ff]', v))
+                if kana_count >= 2 and kana_count / max(len(v), 1) >= 0.2:
+                    return False, f"键 '{k}' 仍包含大量日文假名，请翻译为 {self.target_lang}"
         
         return True, ""
 
@@ -538,7 +562,11 @@ def main():
     parser.add_argument("-o", "--output", help="输出文件路径")
     parser.add_argument("-s", "--source", default="Japanese", help="源语言")
     parser.add_argument("-l", "--lang", default="简体中文", help="目标语言")
-    parser.add_argument("-c", "--config", default="config.yaml", help="配置文件路径")
+    default_config_path = os.path.join(
+        os.path.dirname(os.path.abspath(sys.executable if getattr(sys, 'frozen', False) else __file__)),
+        "config.yaml"
+    )
+    parser.add_argument("-c", "--config", default=default_config_path, help="配置文件路径 (默认位于程序/exe目录)")
     parser.add_argument("-a", "--api", help="指定使用的 API 名称 (对应 config.yaml 中的 apis 键名)") # 新增参数
     parser.add_argument("--format", choices=['srt', 'ass'], default='srt', help="输出格式")
     parser.add_argument("--reflect", action="store_true", help="开启反思模式")
@@ -562,8 +590,8 @@ def main():
         # 默认生成新结构的配置
         default_config = {
             "apis": {
-                "openai": {"api_key": "YOUR_API_KEY", "base_url": "https://api.openai.com/v1", "model": "gpt-4o"},
-                "gemini": {"api_key": "YOUR_API_KEY", "base_url": "https://kaka.liugngg.top/v1", "model": "gemini-1.5-flash"}
+                "openai": {"api_key": "YOUR_API_KEY", "base_url": "https://api.openai.com/v1", "model": "gpt-4o", "format": "responses"},
+                "gemini": {"api_key": "YOUR_API_KEY", "base_url": "https://kaka.liugngg.top/v1", "model": "gemini-1.5-flash", "format": "chat_completions"}
             },
             "default_api": "openai",
             "settings": {
@@ -654,7 +682,11 @@ def main():
                 if output_is_dir:
                     input_filename = os.path.basename(srt_file)
                     name_without_ext = os.path.splitext(input_filename)[0]
-                    output_file = os.path.join(args.output, f"{name_without_ext}.{args.lang}.{output_format}")
+                    output_filename = (
+                        f"{name_without_ext}.ass" if output_format == 'ass'
+                        else f"{name_without_ext}.{args.lang}.srt"
+                    )
+                    output_file = os.path.join(args.output, output_filename)
                     os.makedirs(os.path.dirname(output_file) or args.output, exist_ok=True)
                 else:
                     output_file = args.output
