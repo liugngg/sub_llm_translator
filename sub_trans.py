@@ -380,7 +380,7 @@ class LLMTranslator(BaseTranslator):
     MAX_STEPS = 3  # Agent 纠错循环
 
     def __init__(self, api_config: dict, prompts: dict, thread_num: int, batch_num: int, 
-                source_lang: str, target_lang: str, cache_dir: str, is_reflect: bool = False, 
+                source_lang: str, target_lang: str, cache_dir: str, 
                 temperature: float = 0.6, timeout: int = 60): # 增加 timeout 参数及其默认值
         
         super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir, timeout)
@@ -399,7 +399,6 @@ class LLMTranslator(BaseTranslator):
         if self.api_format not in ('chat_completions', 'responses'):
             raise ValueError("API format 必须是 chat_completions 或 responses")
         self.prompts = prompts
-        self.is_reflect = is_reflect
         self.temperature = temperature
 
     def _get_prompt(self, ptype: str) -> str:
@@ -411,8 +410,7 @@ class LLMTranslator(BaseTranslator):
 
     def _translate_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
         subtitle_dict = {str(d.index): d.original_text for d in chunk}
-        prompt_type = "reflect" if self.is_reflect else "standard"
-        system_prompt = self._get_prompt(prompt_type)
+        system_prompt = self._get_prompt("standard")
         # Responses API requires an explicit JSON instruction when using
         # text.format.type=json_object, even if the prompt contains an example.
         if self.api_format == 'responses' and 'json' not in system_prompt.lower():
@@ -420,14 +418,25 @@ class LLMTranslator(BaseTranslator):
         
         try:
             result_dict = self._agent_loop(system_prompt, subtitle_dict)
-            
+            suspect = {k: source for k, source in subtitle_dict.items()
+                       if self._looks_untranslated(source, result_dict[k])}
+            if suspect:
+                self.write(f"\n[-] 检出 {len(suspect)} 条疑似未翻译字幕，仅重译这些条目")
+                try:
+                    retry_dict = self._agent_loop(
+                        system_prompt + "\nTranslate every supplied subtitle into " + self.target_lang +
+                        ". Do not copy the source text unless it is a proper name or intentional foreign dialogue.",
+                        suspect)
+                except Exception as e:
+                    self.write(f"\n[-] 疑似条目重译请求失败，将原文标记输出: {e}")
+                    retry_dict = {}
+                for key, source in suspect.items():
+                    candidate = retry_dict.get(key)
+                    result_dict[key] = (candidate if candidate is not None and
+                                        not self._looks_untranslated(source, candidate)
+                                        else f"【{source}】")
             for d in chunk:
-                val = result_dict[str(d.index)]
-                if self.is_reflect and isinstance(val, dict):
-                    # 在反思模式下，尝试从 'native_translation' 获取，否则使用原始值
-                    d.translated_text = val.get('native_translation', str(val))
-                else:
-                    d.translated_text = str(val)
+                d.translated_text = result_dict[str(d.index)]
             return chunk
         except (RateLimitError, APITimeoutError, TranslationError) as e:
             # 直接将这些错误向上抛出，由 _process_chunk_with_retry 处理
@@ -499,6 +508,22 @@ class LLMTranslator(BaseTranslator):
         # 达到最大纠错次数仍未成功，抛出 TranslationError
         raise TranslationError(f"LLM在 {self.MAX_STEPS} 次纠错后仍未能返回正确格式的结果。最后一个结果: {last_resp_dict}")
 
+    def _looks_untranslated(self, source: str, translation: Any) -> bool:
+        if not isinstance(translation, str) or not translation.strip():
+            return True
+        # For Japanese-to-Chinese translation, substantial remaining kana is a
+        # useful signal; short phrases and intentional foreign dialogue remain exempt.
+        if self.source_lang.lower() in {"japanese", "日语", "日本語"} and \
+                self.target_lang.lower() in {"简体中文", "繁体中文", "中文", "chinese"}:
+            kana_count = len(re.findall(r'[\u3040-\u30ff]', translation))
+            if kana_count >= 2 and kana_count / max(len(translation), 1) >= 0.2:
+                return True
+            compact_source = re.sub(r'\s+', '', source)
+            compact_translation = re.sub(r'\s+', '', translation)
+            if len(compact_source) >= 4 and compact_source == compact_translation:
+                return True
+        return False
+
     def _validate_response(self, resp_dict: Any, origin_dict: Dict[str, str]) -> Tuple[bool, str]:
         if not isinstance(resp_dict, dict):
             return False, f"返回结果不是一个字典类型，而是 {type(resp_dict)}"
@@ -518,21 +543,9 @@ class LLMTranslator(BaseTranslator):
         #     # 为了更严格，我们视为错误。
         #     return False, f"返回结果包含不应存在的额外键: {extra}"
 
-        if self.is_reflect:
-            for k in origin_keys:
-                v = resp_dict.get(k)
-                if not isinstance(v, dict) or 'native_translation' not in v or not isinstance(v['native_translation'], str):
-                    return False, f"键 '{k}' 的值不符合反思模式的要求 (需为包含 'native_translation' 键的字典，且 'native_translation' 的值需为字符串)"
-        else:
-            for k in origin_keys:
-                v = resp_dict.get(k)
-                if not isinstance(v, str):
-                    return False, f"键 '{k}' 的值不符合标准模式的要求 (需为字符串类型)"
-                # A high density of Japanese kana usually means the source was copied
-                # instead of translated. Ask the model to correct it in the agent loop.
-                kana_count = len(re.findall(r'[\u3040-\u30ff]', v))
-                if kana_count >= 2 and kana_count / max(len(v), 1) >= 0.2:
-                    return False, f"键 '{k}' 仍包含大量日文假名，请翻译为 {self.target_lang}"
+        for k in origin_keys:
+            if not isinstance(resp_dict.get(k), str):
+                return False, f"键 '{k}' 的值不是字符串"
         
         return True, ""
 
@@ -569,7 +582,6 @@ def main():
     parser.add_argument("-c", "--config", default=default_config_path, help="配置文件路径 (默认位于程序/exe目录)")
     parser.add_argument("-a", "--api", help="指定使用的 API 名称 (对应 config.yaml 中的 apis 键名)") # 新增参数
     parser.add_argument("--format", choices=['srt', 'ass'], default='srt', help="输出格式")
-    parser.add_argument("--reflect", action="store_true", help="开启反思模式")
     parser.add_argument("--bilingual", action="store_true", help="输出双语对照")
     
     args = parser.parse_args()
@@ -650,13 +662,12 @@ def main():
         source_lang=args.source,
         target_lang=args.lang,
         cache_dir=settings.get('cache_dir', './.cache_sub_trans'),
-        is_reflect=args.reflect,
         temperature=settings.get('temperature', 0.7),
         timeout=settings.get('timeout', 30)
     )
 
     # 开始翻译：
-    print(f"[*] 任务开始: {args.source} -> {args.lang} | 模式: {'反思' if args.reflect else '标准'} | 并行数: {translator.thread_num} | 单批数量: {translator.batch_num} | 温度: {translator.temperature}")
+    print(f"[*] 任务开始: {args.source} -> {args.lang} | 并行数: {translator.thread_num} | 单批数量: {translator.batch_num} | 温度: {translator.temperature}")
     print("="*80)
     for i, srt_file in enumerate(srt_files, 1):
         # ... (循环内部逻辑保持不变)

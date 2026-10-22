@@ -69,8 +69,9 @@ python sub_trans.py -i <输入文件或目录> [选项]
 | `-c`, `--config` | 程序目录下的 `config.yaml` | YAML 配置文件路径。源码运行时默认为脚本目录，打包运行时默认为 exe 目录。 |
 | `-a`, `--api` | 配置中的 `default_api` | 选择 `apis` 下的服务配置名称。 |
 | `--format` | `srt` | 输出格式，可选 `srt` 或 `ass`。显式指定 `--output` 为 `.ass` 文件时也会按扩展名输出 ASS。 |
-| `--reflect` | 关闭 | 使用反思提示词，通常能改善语境和口语表达，但增加 token 消耗。 |
 | `--bilingual` | 关闭 | 输出原文与译文双语字幕。 |
+
+日译中时，程序会检测译文中疑似未翻译的日文假名；仅将可疑字幕单独重译一次。重译后仍未通过检查或请求失败时，该字幕译文会以 `【原文】` 标记输出。
 | `-h`, `--help` | — | 显示参数帮助并退出。 |
 
 示例：
@@ -82,8 +83,8 @@ python sub_trans.py -i input.srt
 # 指定配置、API 服务和语言，并保存到指定文件
 python sub_trans.py -i input.srt -c .\config.yaml -a compatible -s Japanese -l 简体中文 -o output.srt
 
-# 递归处理目录，输出 ASS 双语字幕并开启反思模式
-python sub_trans.py -i .\subtitles -o .\translated --format ass --bilingual --reflect
+# 递归处理目录，输出 ASS 双语字幕
+python sub_trans.py -i .\subtitles -o .\translated --format ass --bilingual
 ```
 
 ## 打包

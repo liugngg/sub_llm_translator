@@ -24,22 +24,3 @@ You excel at transforming raw Japanese transcripts into fluent, evocative, and c
 </output_format>
 """
     
-single = "Translate the following ${source_language} text into ${target_language}. Output only the result."
-    
-reflect = """
-You are a professional subtitle translator. Source: ${source_language}, Target: ${target_language}.
-<instructions>
-Stage 1: Initial Translation.
-Stage 2: Machine Translation Detection & Deep Analysis (Structural rigidity, cultural mismatch).
-Stage 3: Native-Quality Rewrite.
-</instructions>
-<output_format>
-{
-  "index": {
-    "initial_translation": "...",
-    "reflection": "...",
-    "native_translation": "..."
-  }
-}
-</output_format>
-"""
