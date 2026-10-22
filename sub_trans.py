@@ -224,11 +224,16 @@ class ASRData:
             t = f"{parts[0]}.{ms}"
         return t
 
-    def to_srt(self, output_path: str, bilingual: bool = False):
-        # 输出srt字幕之前，先进行字幕清理和合并：
+    def prepare_output(self):
+        """Apply subtitle cleanup and merge rules to both tracks before export."""
+        self.srt_clean()
         self.srt_clean(translated_text=True)
         self.srt_merge(translated_text=True)
         self.srt_clean(translated_text=True)
+
+    def to_srt(self, output_path: str, bilingual: bool = False):
+        # 所有字幕翻译完成后，输出前再次清理原文与译文并合并。
+        self.prepare_output()
         # 输出srt字幕
         with open(output_path, 'w', encoding='utf-8-sig') as f:
             for i, seg in enumerate(self.segments, 1):
@@ -237,10 +242,8 @@ class ASRData:
                 else: f.write(f"{seg.translated_text}\n\n")
 
     def to_ass(self, output_path: str, bilingual: bool = False):
-        # 输出srt字幕之前，先进行字幕清理和合并：
-        self.srt_clean(translated_text=True)
-        self.srt_merge(translated_text=True)
-        self.srt_clean(translated_text=True)
+        # 所有字幕翻译完成后，输出前再次清理原文与译文并合并。
+        self.prepare_output()
         with open(output_path, 'w', encoding='utf-8-sig') as f:
             f.write(ass_header + "\n")
             for seg in self.segments:
