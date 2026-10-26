@@ -413,39 +413,45 @@ class LLMTranslator(BaseTranslator):
 
     def _translate_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
         subtitle_dict = {str(d.index): d.original_text for d in chunk}
+        chunk_range = f"{chunk[0].index}-{chunk[-1].index}" if len(chunk) > 1 else f"{chunk[0].index}"
         system_prompt = self._get_prompt("standard")
         # Responses API requires an explicit JSON instruction when using
         # text.format.type=json_object, even if the prompt contains an example.
         if self.api_format == 'responses' and 'json' not in system_prompt.lower():
             system_prompt += "\nReturn only a valid JSON object."
-        
+
         try:
             result_dict = self._agent_loop(system_prompt, subtitle_dict)
             suspect = {k: source for k, source in subtitle_dict.items()
                        if self._looks_untranslated(source, result_dict[k])}
             if suspect:
-                self.write(f"\n[-] 检出 {len(suspect)} 条疑似未翻译字幕，仅重译这些条目")
+                self.write(f"\n[-] 检出 {len(suspect)} 条疑似未翻译字幕 (chunk {chunk_range})，仅重译这些条目")
+                retry_dict = {}
                 try:
                     retry_dict = self._agent_loop(
                         system_prompt + "\nTranslate every supplied subtitle into " + self.target_lang +
                         ". Do not copy the source text unless it is a proper name or intentional foreign dialogue.",
                         suspect)
                 except Exception as e:
-                    self.write(f"\n[-] 疑似条目重译请求失败，将原文标记输出: {e}")
-                    retry_dict = {}
+                    self.write(f"\n[-] 疑似条目重译请求失败 (chunk {chunk_range}): {e}，将原文标记输出")
+                # 无论重译成功与否，都要处理疑似条目的标记
                 for key, source in suspect.items():
                     candidate = retry_dict.get(key)
-                    result_dict[key] = (candidate if candidate is not None and
-                                        not self._looks_untranslated(source, candidate)
-                                        else f"【{source}】")
+                    if candidate is not None and not self._looks_untranslated(source, candidate):
+                        result_dict[key] = candidate
+                    else:
+                        result_dict[key] = f"【{source}】"
+                        self.write(f"[!] 字幕 {key} 标记为未翻译: {source[:30]}...")
             for d in chunk:
                 d.translated_text = result_dict[str(d.index)]
             return chunk
         except (RateLimitError, APITimeoutError, TranslationError) as e:
             # 直接将这些错误向上抛出，由 _process_chunk_with_retry 处理
+            self.write(f"\n[-] Chunk {chunk_range} 翻译失败: {type(e).__name__}")
             raise e
         except Exception as e:
             # 捕获其他所有未预料的错误，并包装成 TranslationError
+            self.write(f"\n[-] Chunk {chunk_range} 遇到未知错误: {e}")
             raise TranslationError(f"在LLM翻译或解析结果时发生未知错误: {e}") from e
 
     def _agent_loop(self, system_prompt: str, subtitle_dict: Dict[str, str]) -> Dict[str, Any]:
@@ -512,6 +518,10 @@ class LLMTranslator(BaseTranslator):
         raise TranslationError(f"LLM在 {self.MAX_STEPS} 次纠错后仍未能返回正确格式的结果。最后一个结果: {last_resp_dict}")
 
     def _looks_untranslated(self, source: str, translation: Any) -> bool:
+        """
+        检测译文是否疑似未翻译。
+        针对日译中场景优化：避免短字幕误判，规范化标点符号。
+        """
         if not isinstance(translation, str) or not translation.strip():
             return True
         # For Japanese-to-Chinese translation, substantial remaining kana is a
@@ -519,11 +529,15 @@ class LLMTranslator(BaseTranslator):
         if self.source_lang.lower() in {"japanese", "日语", "日本語"} and \
                 self.target_lang.lower() in {"简体中文", "繁体中文", "中文", "chinese"}:
             kana_count = len(re.findall(r'[\u3040-\u30ff]', translation))
-            if kana_count >= 2 and kana_count / max(len(translation), 1) >= 0.2:
+            trans_len = len(translation)
+            # \u77ed\u5b57\u5e55\uff08<10\u5b57\u7b26\uff09\u63d0\u9ad8\u5047\u540d\u5360\u6bd4\u9608\u503c\uff0c\u907f\u514d\u8bef\u5224\u4eba\u540d\u3001\u53e3\u8bed
+            threshold = 0.4 if trans_len < 10 else 0.2
+            if kana_count >= 2 and kana_count / max(trans_len, 1) >= threshold:
                 return True
-            compact_source = re.sub(r'\s+', '', source)
-            compact_translation = re.sub(r'\s+', '', translation)
-            if len(compact_source) >= 4 and compact_source == compact_translation:
+            # \u89c4\u8303\u5316\u6807\u70b9\uff1a\u79fb\u9664\u6807\u70b9\u548c\u7a7a\u683c\u540e\u6bd4\u8f83
+            normalized_source = re.sub(r'[\s\u3000\u2000-\u206f\u3001-\u303f\uff00-\uffef!\uff01?\uff1f,.\uff0c\u3002\u3001;\uff1b:\uff1a\u2026\-\u2014]+', '', source)
+            normalized_translation = re.sub(r'[\s\u3000\u2000-\u206f\u3001-\u303f\uff00-\uffef!\uff01?\uff1f,.\uff0c\u3002\u3001;\uff1b:\uff1a\u2026\-\u2014]+', '', translation)
+            if len(normalized_source) >= 4 and normalized_source == normalized_translation:
                 return True
         return False
 
@@ -652,10 +666,39 @@ def main():
         raise ValueError("配置文件必须包含 settings 映射")
     if not isinstance(selected_api_config, dict) or not all(selected_api_config.get(k) for k in ('api_key', 'base_url', 'model')):
         raise ValueError(f"API 配置 [{api_name}] 必须包含 api_key、base_url 和 model")
+
+    # 增强的配置验证
     for setting_name, minimum in (("thread_num", 1), ("batch_num", 1), ("timeout", 1)):
         value = settings.get(setting_name, {"thread_num": 4, "batch_num": 40, "timeout": 30}[setting_name])
         if not isinstance(value, int) or value < minimum:
             raise ValueError(f"settings.{setting_name} 必须是大于等于 {minimum} 的整数")
+
+    # 验证 temperature 范围
+    temperature = settings.get('temperature', 0.7)
+    if not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
+        raise ValueError("settings.temperature 必须是 0 到 2 之间的数值")
+
+    # 验证 merge_interval 和 max_duration
+    merge_interval = settings.get('merge_interval', 0.7)
+    max_duration = settings.get('max_duration', 8)
+    if not isinstance(merge_interval, (int, float)) or merge_interval < 0:
+        raise ValueError("settings.merge_interval 必须是非负数值")
+    if not isinstance(max_duration, (int, float)) or max_duration <= 0:
+        raise ValueError("settings.max_duration 必须是正数值")
+
+    # 验证 replacements 中的正则表达式
+    replacements = config.get('replacements', {})
+    if replacements and isinstance(replacements, dict):
+        invalid_patterns = []
+        for pattern in replacements.keys():
+            try:
+                re.compile(pattern)
+            except re.error:
+                invalid_patterns.append(pattern)
+        if invalid_patterns:
+            print(f"[!] 警告：以下正则表达式语法无效，将被忽略: {invalid_patterns}")
+            for pattern in invalid_patterns:
+                del replacements[pattern]
 
     translator = LLMTranslator(
         api_config=selected_api_config,
@@ -665,7 +708,7 @@ def main():
         source_lang=args.source,
         target_lang=args.lang,
         cache_dir=settings.get('cache_dir', './.cache_sub_trans'),
-        temperature=settings.get('temperature', 0.7),
+        temperature=temperature,
         timeout=settings.get('timeout', 30)
     )
 
