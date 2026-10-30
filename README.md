@@ -27,11 +27,12 @@ apis:
     model: "your-model-name"
 default_api: openai
 settings:
-  thread_num: 4
-  batch_num: 40
+  thread_num: 2
+  batch_num: 10
   cache_dir: "./.cache_sub_trans"
-  temperature: 0.7
-  timeout: 30
+  temperature: 0.3
+  timeout: 45
+  request_interval: 1
   merge_interval: 0.7
   max_duration: 8
 replacements: {}
@@ -41,18 +42,21 @@ replacements: {}
 
 `apis` 可配置多个服务。每个服务都需要 `api_key`、`base_url` 和 `model`。`default_api` 指定默认服务；也可通过 `-a/--api` 选择其他服务。密钥请只保存在本机配置或环境变量中，不要提交到版本库。
 
+配置多个服务时，程序会自动轮询：先使用 `-a` 指定的服务（未指定时用 `default_api`），其余服务按配置文件顺序作为后备。某个批次遇到认证错误、模型不存在或整批内容审查拒绝时，会切换到下一个服务重试；某个服务翻译成功后，后续请求优先使用它。密钥或地址缺失的服务会被跳过并给出警告。命中缓存时不会发起请求，因此也不会触发切换。
+
 | 配置项 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `settings.thread_num` | `4` | 并发翻译请求数。遇到服务限流时调低。 |
-| `settings.batch_num` | `40` | 每个请求最多包含的字幕条目数。调大可减少请求次数，但会增加单次请求上下文和失败重试成本。 |
-| `settings.cache_dir` | `./.cache_sub_trans` | 翻译缓存目录。成功的批次缓存 7 天。重复运行相同内容可复用缓存。 |
-| `settings.temperature` | `0.7` | 模型采样温度；具体支持范围取决于服务。 |
-| `settings.timeout` | `30` | 单次 API 请求超时秒数，必须为正整数。 |
+| `settings.thread_num` | `2` | 并发翻译请求数。遇到服务限流时调低。 |
+| `settings.batch_num` | `10` | 每个请求最多包含的字幕条目数。调大可减少请求次数，但会增加单次请求上下文和失败重试成本。 |
+| `settings.cache_dir` | `./.cache_sub_trans` | 翻译缓存目录。成功批次缓存 7 天；包含审查标记的结果缓存 1 小时；网络等失败不缓存。缓存按服务地址、模型、接口、温度和提示词隔离。 |
+| `settings.temperature` | `0.3` | 模型采样温度；具体支持范围取决于服务。 |
+| `settings.timeout` | `45` | 单次 API 请求超时秒数，必须为正整数。 |
+| `settings.request_interval` | `1` | 相邻两次 API 请求的最小间隔（秒），必须为非负数，`0` 表示不限速。多线程共享同一条时间线，用于避免高并发触发限流。 |
 | `settings.merge_interval` | `0.7` | 合并相邻字幕的最大时间间隔（秒），必须为非负数。 |
 | `settings.max_duration` | `8` | 合并后字幕段允许的最大时长（秒），必须为正数。 |
 | `replacements` | `{}` | 翻译前的文本替换映射，键为原文，值为替换文本；支持项目已有的正则替换规则。启动时会检查正则表达式语法，无效的将被忽略并发出警告。 |
 
-**配置验证：** 程序启动时会验证配置的合法性。`temperature` 必须在 0-2 之间，`thread_num`、`batch_num`、`timeout` 必须为正整数，`merge_interval` 和 `max_duration` 必须为有效数值。
+**配置验证：** 程序启动时会验证配置的合法性。`temperature` 必须在 0-2 之间，`thread_num`、`batch_num`、`timeout` 必须为正整数，`merge_interval`、`max_duration`、`request_interval` 必须为有效数值。
 
 ## 命令行参数
 
@@ -73,6 +77,14 @@ python sub_trans.py -i <输入文件或目录> [选项]
 | `--format` | `srt` | 输出格式，可选 `srt` 或 `ass`。显式指定 `--output` 为 `.ass` 文件时也会按扩展名输出 ASS。 |
 | `--bilingual` | 关闭 | 输出原文与译文双语字幕。 |
 | `-h`, `--help` | — | 显示参数帮助并退出。 |
+
+### 请求失败与审查处理
+
+- 网络、限流或格式错误最多尝试 3 次，两次重试前分别等待 1 秒、2 秒。SDK 自身也可能重试网络请求，因此 HTTP 请求数可能更多。
+- 配置了多个服务时，认证错误、模型不存在或整批审查拒绝会切换到下一个服务重新请求；所有服务均拒绝时才对半拆分批次隔离处理，单条仍被拒绝则输出 `【云端审查】原文`。JSON 内的明确拒绝说明只标记对应条目，保留其他译文。
+- 普通失败耗尽重试后输出 `【翻译失败】原文`，其他批次继续处理。所有服务均认证失败时终止当前文件；目录模式会继续尝试后续文件。
+- 内容审查处理不会保证云端服务接受内容；服务商的政策和模型行为仍然适用。
+- 以上默认值用于新生成配置及缺省字段，已有配置中明确设置的值保持有效。
 
 ### 漏翻检测与标记
 
@@ -122,7 +134,10 @@ PyInstaller 需要包含 Python 运行时以及 `openai`、HTTP 客户端、YAML
 ## 开发检查
 
 ```powershell
-python -m compileall sub_trans.py prompts.py
+uv run python -m compileall sub_trans.py prompts.py
+uv run python -m unittest discover -s test -p "test_*.py" -v
+# 单个测试（从项目根目录运行，避开系统 Python 的同名 test 包）
+uv run python -m unittest discover -s test -p test_translation.py -k test_ordinary_dialogue_is_not_a_refusal -v
 ```
 
-项目目前没有自动化测试套件。涉及翻译逻辑的修改后，请用小型 SRT 文件手动验证普通行、空行、缓存命中以及所需输出格式。
+测试涵盖字幕处理及使用模拟 API 的翻译工作流，不调用真实服务。涉及翻译逻辑的修改后，还需使用获准提交云端的小型 SRT 手动验证真实服务兼容性、缓存命中以及所需输出格式。
