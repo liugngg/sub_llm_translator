@@ -1,5 +1,16 @@
 # prompts.py
 
+"""Built-in prompts and optional external prompt-file loading.
+
+The built-in prompt keeps the executable self-contained.  ``load_prompt_file`` lets
+users override one or more prompts from a YAML file without editing Python code.
+"""
+
+from pathlib import Path
+from typing import Any, Dict, Mapping
+
+import yaml
+
 standard = """
 <role>
 You translate existing ${source_language} subtitle files into ${target_language}.
@@ -69,3 +80,26 @@ Return only a valid JSON object:
 { "index": "translated text" }
 </output_format>
 """
+
+
+def load_prompt_file(path: str | Path, base_prompts: Mapping[str, str] | None = None) -> Dict[str, str]:
+    """Load prompt overrides from a YAML mapping and merge them with built-ins.
+
+    The file may use either ``standard: |`` at the top level or a nested
+    ``prompts:`` mapping.  A missing/invalid prompt is rejected so callers can
+    fall back cleanly instead of sending an empty system prompt to the model.
+    """
+    prompt_path = Path(path).expanduser()
+    with prompt_path.open("r", encoding="utf-8-sig") as handle:
+        data: Any = yaml.safe_load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("提示词文件必须是 YAML 映射")
+    if isinstance(data.get("prompts"), dict):
+        data = data["prompts"]
+
+    merged = dict(base_prompts or {"standard": standard})
+    overrides = {str(key): value for key, value in data.items() if isinstance(value, str)}
+    if not overrides:
+        raise ValueError("提示词文件中没有找到字符串提示词")
+    merged.update(overrides)
+    return merged
