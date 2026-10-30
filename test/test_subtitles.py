@@ -89,6 +89,19 @@ class SubtitleProcessingTests(unittest.TestCase):
 
         self.assertIn("Dialogue: 0,0:00:01.23,0:00:02.34,Default,,0,0,0,,你好\\Nこんにちは", contents)
 
+    def test_failure_marks_survive_output_cleanup(self):
+        data = ASRData([
+            segment(1, "原文", "00:00:01,000", "00:00:02,000", "【云端审查】原文"),
+            segment(2, "失败", "00:00:03,000", "00:00:04,000", "【翻译失败】失败"),
+        ])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "marked.srt"
+            data.to_srt(str(output))
+            contents = output.read_text(encoding="utf-8-sig")
+
+        self.assertIn("【云端审查】原文", contents)
+        self.assertIn("【翻译失败】失败", contents)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import hashlib
 import argparse
 import re
 import time
+import threading
 from datetime import timedelta
 import atexit
 import sys # 导入 sys 模块用于程序退出
@@ -48,6 +49,19 @@ REPEAT_CONTENT_RE = re.compile(r'(.{2,}?)([\s,.!?;，。！？；]*)\1+', flags=
 
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
 BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔]*$', flags=re.UNICODE|re.MULTILINE)
+###############################################################
+
+# ###########失败标记#######################
+# 译文位置保留原文并加标记，便于人工定位补译。
+# 【原文】：模型未能正确翻译（漏翻、残留假名等）
+# 【云端审查】：云端服务的内容审查拦截了该条字幕
+# 【翻译失败】：网络、超时或格式错误导致多次重试后仍失败
+UNTRANSLATED_MARK = "【{text}】"
+CENSORED_MARK_PREFIX = "【云端审查】"
+FAILED_MARK_PREFIX = "【翻译失败】"
+CENSORED_MARK = CENSORED_MARK_PREFIX + "{text}"
+FAILED_MARK = FAILED_MARK_PREFIX + "{text}"
+MARK_PREFIXES = (CENSORED_MARK_PREFIX, FAILED_MARK_PREFIX, "【")
 ###############################################################
 
 
@@ -144,7 +158,11 @@ class ASRData:
         i = 0
         for segment in self.segments:
             if translated_text:
-                segment.translated_text = self.clean_line(segment.translated_text)
+                # 只保护译文中的失败标记；原文中的【标签】仍按普通字幕清理。
+                marked = segment.translated_text.startswith(MARK_PREFIXES) or (
+                    segment.translated_text.startswith("【") and segment.translated_text.endswith("】"))
+                if not marked:
+                    segment.translated_text = self.clean_line(segment.translated_text)
                 # Empty translations fall back to the source so exports never lose dialogue.
                 if not segment.translated_text:
                     segment.translated_text = segment.text
@@ -257,26 +275,48 @@ class ASRData:
 # 2. 基础翻译器基类 (改进：进度条 & 缓存清理 & 新的错误处理/重试机制)
 # ==========================================
 
-class TranslationError(Exception):
+class TranslatorError(Exception):
     """自定义异常，用于表示翻译过程中LLM返回结果不符合预期"""
     pass
+
+
+class TranslationError(TranslatorError):
+    """可重试的翻译失败（格式错误、超时、限流等）。"""
+    pass
+
 
 class FatalTranslationError(TranslationError):
     """An API/configuration failure that should not be retried."""
     pass
 
-class BaseTranslator(ABC):
-    MAX_CHUNK_RETRIES = 2 # 针对单个chunk的最大重试次数
 
-    def __init__(self, thread_num: int, batch_num: int, source_lang: str, target_lang: str, cache_dir: str, timeout: int):
+class CensoredTranslationError(TranslationError):
+    """云端服务的内容审查拦截，重试同一内容通常无效，应快速失败。"""
+    pass
+
+
+class BaseTranslator(ABC):
+    MAX_CHUNK_RETRIES = 3 # 针对单个chunk的最大重试次数
+    MAX_BACKOFF_SECONDS = 8 # 指数退避上限
+
+    def __init__(self, thread_num: int, batch_num: int, source_lang: str, target_lang: str,
+                 cache_dir: str, timeout: int, request_interval: float = 0.0):
         self.thread_num = thread_num
         self.batch_num = batch_num
         self.source_lang = source_lang
         self.target_lang = target_lang
         self.timeout = timeout # 新增 timeout 参数
+        # 相邻两次 API 请求之间的最小间隔（秒）；0 表示不限速。
+        self.request_interval = request_interval
+        self._throttle_lock = threading.Lock()
+        self._next_request_time = 0.0
+        # 服务端点轮询：线程本地记录当前使用的端点，共享的 preferred 作为下一次起点。
+        self._local = threading.local()
+        self._preferred_index = 0
+        self._preferred_lock = threading.Lock()
         # 设置缓存目录并清理过期缓存
         self.cache = Cache(cache_dir)
-        self.cache.expire() 
+        self.cache.expire()
 
         # 全局进度条变量：
         self.pbar = None
@@ -285,11 +325,43 @@ class BaseTranslator(ABC):
         atexit.register(self.stop)
 
     def write(self, msg: str):
-        if self.pbar: 
+        if self.pbar:
             self.pbar.write(msg)
         else:
             print(msg)
-    
+
+    def _throttle(self):
+        """在相邻两次 API 请求之间保持最小间隔，跨线程共享同一时间线。"""
+        if self.request_interval <= 0:
+            return
+        with self._throttle_lock:
+            now = time.monotonic()
+            if self._next_request_time > now:
+                time.sleep(self._next_request_time - now)
+                now = time.monotonic()
+            self._next_request_time = now + self.request_interval
+
+    # ---- 服务端点轮询（默认单端点，子类可覆盖） ----
+    def _endpoint_count(self) -> int:
+        return 1
+
+    def _preferred_endpoint(self) -> int:
+        with self._preferred_lock:
+            return self._preferred_index % max(self._endpoint_count(), 1)
+
+    def _set_preferred_endpoint(self, index: int):
+        with self._preferred_lock:
+            self._preferred_index = index % max(self._endpoint_count(), 1)
+
+    def _activate_endpoint(self, index: int):
+        self._local.endpoint_index = index
+
+    def _active_endpoint(self) -> int:
+        return getattr(self._local, 'endpoint_index', 0)
+
+    def _endpoint_label(self, index: int) -> str:
+        return f"#{index + 1}"
+
     def translate(self, asr_data: ASRData) -> ASRData:
         translate_data_list = [
             SubtitleProcessData(index=seg.index, original_text=seg.text)
@@ -308,9 +380,13 @@ class BaseTranslator(ABC):
                 result_chunk = future.result()
                 for data in result_chunk:
                     translated_map[data.index] = data.translated_text
+            except FatalTranslationError:
+                # API 认证/配置错误无法通过重试或拆分恢复，中断整体任务。
+                raise
             except Exception as e:
-                # _process_chunk_with_retry 内部已经处理了重试和退出逻辑，
-                # 如果到这里抛出异常，说明是其他未知且致命的线程池错误。
+                # _process_chunk_with_retry 内部已经将可恢复的失败（审查拦截、
+                # 超时、格式错误等）降级为逐条标记，不会再抛到这里。
+                # 如果仍然到达这里，说明是未预料的致命错误，中断整体任务。
                 self.write(f"\n[-] 批处理执行遇到未知致命错误: {e}")
                 raise TranslationError(f"批处理执行失败: {e}") from e
             finally:
@@ -325,10 +401,43 @@ class BaseTranslator(ABC):
 
     def _process_chunk_with_retry(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
         """
-        处理单个 chunk，包含缓存、错误处理和重试逻辑。
+        处理单个 chunk：先按当前端点重试，认证/审查类失败时轮询其余服务端点。
+        所有端点都被审查拒绝时才继续拆分批次隔离，避免一条敏感内容拖累整批字幕。
         """
+        count = max(self._endpoint_count(), 1)
+        start = self._preferred_endpoint()
+        last_error: Optional[BaseException] = None
+
+        for offset in range(count):
+            index = (start + offset) % count
+            self._activate_endpoint(index)
+            try:
+                return self._translate_chunk_with_retry(chunk)
+            except (FatalTranslationError, CensoredTranslationError) as e:
+                last_error = e
+                if count > 1 and offset + 1 < count:
+                    self.write(f"\n[!] 端点 {self._endpoint_label(index)} 不可用 ({type(e).__name__})，切换下一个服务端点")
+                continue
+
+        # 所有端点都失败：区分审查拒绝与配置/认证错误。
+        if isinstance(last_error, CensoredTranslationError):
+            if len(chunk) <= 1:
+                self.write(f"\n[-] 字幕 {chunk[0].index} 在所有端点均被内容审查拒绝: {last_error}")
+                result = [self._mark_censored(chunk[0])]
+                self._cache_chunk_result(self._generate_chunk_cache_key(chunk), result)
+                return result
+            self.write(f"\n[-] chunk ({len(chunk)} 条) 在所有端点均被审查拒绝，拆分为更小批次隔离重试")
+            result = self._split_and_retry_chunk(chunk)
+            # 拆分子批次各自已缓存；父批次也缓存一份，避免下次重跑再次逐条试探。
+            self._cache_chunk_result(self._generate_chunk_cache_key(chunk), result)
+            return result
+        assert last_error is not None
+        raise last_error
+
+    def _translate_chunk_with_retry(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
+        """在单个端点上处理 chunk，包含缓存、重试与失败降级。"""
         cache_key = self._generate_chunk_cache_key(chunk)
-        
+
         cached = self.cache.get(cache_key)
         if cached:
             self.write(f"[*] 命中缓存: {cache_key}")
@@ -337,35 +446,67 @@ class BaseTranslator(ABC):
         # 重试逻辑
         for attempt in range(1, self.MAX_CHUNK_RETRIES + 1):
             try:
+                self._throttle()
                 result = self._translate_chunk(chunk)
-                # 如果成功，设置缓存并返回
-                self.cache.set(cache_key, [asdict(d) for d in result], expire=86400 * 7)
+                self._cache_chunk_result(cache_key, result)
                 return result
-            
-            except FatalTranslationError:
+
+            except (FatalTranslationError, CensoredTranslationError):
+                # 交给外层端点轮询处理，不在同一服务上重复提交敏感内容。
                 raise
             except (APITimeoutError, RateLimitError, TranslationError) as e:
                 if attempt < self.MAX_CHUNK_RETRIES:
-                    self.write(f"\n[-] 翻译 chunk 失败 (尝试 {attempt}/{self.MAX_CHUNK_RETRIES})，错误: {e}。1秒后重试...")
-                    time.sleep(1) # 等待1秒后重试
+                    backoff = min(2 ** (attempt - 1), self.MAX_BACKOFF_SECONDS)
+                    self.write(f"\n[-] 翻译 chunk 失败 (尝试 {attempt}/{self.MAX_CHUNK_RETRIES})，错误: {e}。{backoff}秒后重试...")
+                    time.sleep(backoff) # 指数退避后重试
                 else:
                     self.write(f"\n[-] 翻译 chunk 失败 (已达最大重试次数 {self.MAX_CHUNK_RETRIES})，错误: {e}")
-                    raise TranslationError(f"chunk 重试失败: {e}") from e
+                    # 单个 chunk 多次重试仍失败时不再中断整个文件，
+                    # 而是将该 chunk 内每条字幕降级标记为【翻译失败】，
+                    # 让其他批次的翻译结果能够正常保留。
+                    return [self._mark_failed(d) for d in chunk]
             except Exception as e:
-                self.write(f"\n[-] 翻译 chunk 遇到未知错误: {e}")
-                raise TranslationError(f"chunk 执行失败: {e}") from e
+                self.write(f"\n[-] 翻译 chunk 遇到未知错误: {e}，降级标记为翻译失败")
+                return [self._mark_failed(d) for d in chunk]
 
-        # 理论上不会执行到这里，因为达到最大重试次数会调用 sys.exit()
-        return [] 
+        # 理论上不会执行到这里，因为达到最大重试次数会提前 return
+        return [self._mark_failed(d) for d in chunk]
+
+    @staticmethod
+    def _mark_censored(data: SubtitleProcessData) -> SubtitleProcessData:
+        data.translated_text = CENSORED_MARK.format(text=data.original_text)
+        return data
+
+    @staticmethod
+    def _mark_failed(data: SubtitleProcessData) -> SubtitleProcessData:
+        data.translated_text = FAILED_MARK.format(text=data.original_text)
+        return data
+
+    def _split_and_retry_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
+        """将被审查拦截的 chunk 对半拆分，分别递归重试并合并结果。"""
+        mid = len(chunk) // 2
+        left, right = chunk[:mid], chunk[mid:]
+        results: List[SubtitleProcessData] = []
+        for part in (left, right):
+            if not part:
+                continue
+            results.extend(self._process_chunk_with_retry(part))
+        return results
 
     @abstractmethod
     def _translate_chunk(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
         """抽象方法，子类实现具体的翻译逻辑，如果失败应抛出 TranslationError 或 OpenAI API 异常"""
         pass
 
+    def _cache_chunk_result(self, cache_key: str, result: List[SubtitleProcessData]):
+        if any(d.translated_text.startswith(FAILED_MARK_PREFIX) for d in result):
+            return
+        expire = 3600 if any(d.translated_text.startswith(CENSORED_MARK_PREFIX) for d in result) else 86400 * 7
+        self.cache.set(cache_key, [asdict(d) for d in result], expire=expire)
+
     def _generate_chunk_cache_key(self, chunk: List[SubtitleProcessData]) -> str:
-        key_data = [asdict(d) for d in chunk]
-        return f"{self.__class__.__name__}:{generate_cache_key(key_data)}:{self.source_lang}:{self.target_lang}:{self.batch_num}"
+        key_data = [{"index": d.index, "original_text": d.original_text} for d in chunk]
+        return f"v2:{self.__class__.__name__}:{generate_cache_key(key_data)}:{self.source_lang}:{self.target_lang}:{self.batch_num}"
 
     def stop(self):
         self.is_running = False
@@ -382,27 +523,80 @@ def generate_cache_key(data: Any) -> str:
 class LLMTranslator(BaseTranslator):
     MAX_STEPS = 3  # Agent 纠错循环
 
-    def __init__(self, api_config: dict, prompts: dict, thread_num: int, batch_num: int, 
-                source_lang: str, target_lang: str, cache_dir: str, 
-                temperature: float = 0.6, timeout: int = 60): # 增加 timeout 参数及其默认值
-        
-        super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir, timeout)
-        # 设置LLM API接口
+    def __init__(self, api_configs: List[Tuple[str, dict]], prompts: dict, thread_num: int, batch_num: int,
+                source_lang: str, target_lang: str, cache_dir: str,
+                temperature: float = 0.6, timeout: int = 60, request_interval: float = 0.0):
+
+        if not api_configs:
+            raise ValueError("至少需要一个 API 配置")
+        super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir, timeout, request_interval)
+        self.prompts = prompts
+        self.temperature = temperature
+        # 每个端点独立持有 client / model / format，便于失败时整体切换。
+        self.endpoints = [
+            self._build_endpoint(name, cfg) for name, cfg in api_configs
+        ]
+        self._activate_endpoint(0)
+
+    @staticmethod
+    def _build_endpoint(name: str, api_config: dict) -> Dict[str, Any]:
         base_url = api_config.get('base_url')
         if not isinstance(base_url, str) or not base_url.strip():
-            raise ValueError("API 配置必须提供有效的 base_url")
+            raise ValueError(f"API 配置 [{name}] 必须提供有效的 base_url")
         url = base_url.strip().rstrip("/")
         # OpenAI SDK expects a base URL and appends /chat/completions itself.
         # Accept both provider roots and explicit OpenAI-compatible /v1 URLs.
         if not url.lower().endswith("/v1"):
             url += "/v1"
-        self.client = OpenAI(api_key=api_config['api_key'], base_url=url)
-        self.model = api_config['model']
-        self.api_format = api_config.get('format', 'chat_completions').lower()
-        if self.api_format not in ('chat_completions', 'responses'):
-            raise ValueError("API format 必须是 chat_completions 或 responses")
-        self.prompts = prompts
-        self.temperature = temperature
+        api_format = api_config.get('format', 'chat_completions').lower()
+        if api_format not in ('chat_completions', 'responses'):
+            raise ValueError(f"API 配置 [{name}] 的 format 必须是 chat_completions 或 responses")
+        return {
+            "name": name,
+            "client": OpenAI(api_key=api_config['api_key'], base_url=url),
+            "model": api_config['model'],
+            "format": api_format,
+        }
+
+    # ---- 端点属性：始终指向当前线程激活的服务 ----
+    @property
+    def _endpoint(self) -> Dict[str, Any]:
+        return self.endpoints[self._active_endpoint() % len(self.endpoints)]
+
+    @property
+    def client(self):
+        return self._endpoint["client"]
+
+    @property
+    def model(self) -> str:
+        return self._endpoint["model"]
+
+    @property
+    def api_format(self) -> str:
+        return self._endpoint["format"]
+
+    def _endpoint_count(self) -> int:
+        return len(self.endpoints)
+
+    def _endpoint_label(self, index: int) -> str:
+        return self.endpoints[index % len(self.endpoints)]["name"]
+
+    def _translate_chunk_with_retry(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
+        result = super()._translate_chunk_with_retry(chunk)
+        # 成功完成一次请求后，让其他线程也优先使用这个可用端点。
+        if not any(d.translated_text.startswith(FAILED_MARK_PREFIX) for d in result):
+            self._set_preferred_endpoint(self._active_endpoint())
+        return result
+
+    def _generate_chunk_cache_key(self, chunk: List[SubtitleProcessData]) -> str:
+        context = {
+            "base_url": str(self.client.base_url),
+            "model": self.model,
+            "format": self.api_format,
+            "temperature": self.temperature,
+            "prompt": self._get_prompt("standard"),
+        }
+        return f"{super()._generate_chunk_cache_key(chunk)}:{generate_cache_key(context)}"
 
     def _get_prompt(self, ptype: str) -> str:
         content = self.prompts.get(ptype, "")
@@ -422,8 +616,12 @@ class LLMTranslator(BaseTranslator):
 
         try:
             result_dict = self._agent_loop(system_prompt, subtitle_dict)
+            refused = {k for k, source in subtitle_dict.items()
+                       if self._looks_like_provider_refusal(result_dict[k]) and result_dict[k] != source}
+            for key in refused:
+                result_dict[key] = CENSORED_MARK.format(text=subtitle_dict[key])
             suspect = {k: source for k, source in subtitle_dict.items()
-                       if self._looks_untranslated(source, result_dict[k])}
+                       if k not in refused and self._looks_untranslated(source, result_dict[k])}
             if suspect:
                 self.write(f"\n[-] 检出 {len(suspect)} 条疑似未翻译字幕 (chunk {chunk_range})，仅重译这些条目")
                 retry_dict = {}
@@ -432,15 +630,22 @@ class LLMTranslator(BaseTranslator):
                         system_prompt + "\nTranslate every supplied subtitle into " + self.target_lang +
                         ". Do not copy the source text unless it is a proper name or intentional foreign dialogue.",
                         suspect)
+                except FatalTranslationError:
+                    raise
+                except CensoredTranslationError:
+                    retry_dict = {key: CENSORED_MARK.format(text=source) for key, source in suspect.items()}
                 except Exception as e:
                     self.write(f"\n[-] 疑似条目重译请求失败 (chunk {chunk_range}): {e}，将原文标记输出")
                 # 无论重译成功与否，都要处理疑似条目的标记
                 for key, source in suspect.items():
                     candidate = retry_dict.get(key)
-                    if candidate is not None and not self._looks_untranslated(source, candidate):
+                    if isinstance(candidate, str) and (candidate.startswith(CENSORED_MARK_PREFIX) or
+                            self._looks_like_provider_refusal(candidate)):
+                        result_dict[key] = CENSORED_MARK.format(text=source)
+                    elif candidate is not None and not self._looks_untranslated(source, candidate):
                         result_dict[key] = candidate
                     else:
-                        result_dict[key] = f"【{source}】"
+                        result_dict[key] = UNTRANSLATED_MARK.format(text=source)
                         self.write(f"[!] 字幕 {key} 标记为未翻译: {source[:30]}...")
             for d in chunk:
                 d.translated_text = result_dict[str(d.index)]
@@ -471,6 +676,10 @@ class LLMTranslator(BaseTranslator):
                         text={"format": {"type": "json_object"}},
                         timeout=self.timeout
                     )
+                    if any(getattr(part, 'type', None) == 'refusal'
+                           for item in (getattr(response, 'output', None) or [])
+                           for part in (getattr(item, 'content', None) or [])):
+                        raise CensoredTranslationError("Responses API 返回明确拒绝")
                     content = response.output_text
                 else:
                     response = self.client.chat.completions.create(
@@ -480,18 +689,33 @@ class LLMTranslator(BaseTranslator):
                         response_format={"type": "json_object"},
                         timeout=self.timeout
                     )
-                    content = response.choices[0].message.content
+                    choice = response.choices[0]
+                    if choice.finish_reason == 'content_filter' or getattr(choice.message, 'refusal', None):
+                        raise CensoredTranslationError("Chat Completions API 返回明确拒绝")
+                    content = choice.message.content
+            except CensoredTranslationError:
+                raise
             except (AuthenticationError, NotFoundError) as e:
                 raise FatalTranslationError(f"API 认证或资源错误: {e}") from e
             except (RateLimitError, APITimeoutError) as e:
                 # 这些错误向上抛出
                 raise e
             except Exception as e:
+                message = str(e).lower()
+                if any(marker in message for marker in (
+                    "content_filter", "content filter", "responsibleai",
+                    "content_policy_violation", "safety policy violation",
+                    "内容安全拦截", "内容审查拒绝",
+                )):
+                    raise CensoredTranslationError("云端模型以内容审查为由拒绝了该批次") from e
                 # 其他任何 OpenAI 库可能抛出的错误，视为需要重试的 TranslationError
                 raise TranslationError(f"OpenAI API 调用发生错误: {e}") from e
 
             if not content:
                 raise TranslationError("LLM 返回了空内容")
+            # JSON 中可能包含正常的道歉或拒绝对白，不能扫描整个响应判定审查。
+            if not content.lstrip().startswith(('{', '[', '```')) and self._looks_like_provider_refusal(content):
+                raise CensoredTranslationError("云端模型返回了审查或拒绝说明")
             
             try:
                 # 使用 json_repair 处理可能不完整的 JSON
@@ -524,6 +748,8 @@ class LLMTranslator(BaseTranslator):
         """
         if not isinstance(translation, str) or not translation.strip():
             return True
+        if self._looks_like_provider_refusal(translation):
+            return True
         # For Japanese-to-Chinese translation, substantial remaining kana is a
         # useful signal; short phrases and intentional foreign dialogue remain exempt.
         if self.source_lang.lower() in {"japanese", "日语", "日本語"} and \
@@ -540,6 +766,22 @@ class LLMTranslator(BaseTranslator):
             if len(normalized_source) >= 4 and normalized_source == normalized_translation:
                 return True
         return False
+
+    def _looks_like_provider_refusal(self, text: str) -> bool:
+        """Detect policy refusals so they are not written into subtitles."""
+        normalized = re.sub(r'\s+', ' ', text).strip().lower()
+        if not normalized:
+            return False
+        patterns = (
+            r"\b(?:i (?:cannot|can't|am unable to)|i'm unable to|unable to) "
+            r"(?:translate|assist with|help with|provide|generate|fulfill|comply with) "
+            r"(?:this|that|the|your|explicit|sexual)",
+            r"(?:cannot|can't|unable to).{0,60}(?:content policy|safety policy|explicit content)",
+            r"(?:无法|不能|拒绝)(?:为您|为你)?(?:翻译|处理|生成|提供)(?:这些|这个|该|此|色情|露骨)",
+            r"(?:违反|受限于|由于).{0,20}(?:内容政策|安全政策|使用政策)",
+            r"(?:この|その)(?:内容|リクエスト).{0,30}(?:翻訳|対応).{0,10}できません",
+        )
+        return any(re.search(pattern, normalized) for pattern in patterns)
 
     def _validate_response(self, resp_dict: Any, origin_dict: Dict[str, str]) -> Tuple[bool, str]:
         if not isinstance(resp_dict, dict):
@@ -624,12 +866,13 @@ def main():
             },
             "default_api": "openai",
             "settings": {
-                "thread_num": 4, 
-                "batch_num": 40, 
-                "cache_dir": "./.cache_sub_trans", 
-                "temperature": 0.7,
-                "timeout": 30,
-                "merge_interval": 0.7,  
+                "thread_num": 2,
+                "batch_num": 10,
+                "cache_dir": "./.cache_sub_trans",
+                "temperature": 0.3,
+                "timeout": 45,
+                "request_interval": 1,
+                "merge_interval": 0.7,
                 "max_duration": 8
             }
         }
@@ -659,22 +902,35 @@ def main():
             print(f"[*] 未指定 API 且无默认设置，自动选择第一个: {api_name}")
     selected_api_config = available_apis[api_name]
     print(f"[*] 已选择 API 配置: [{api_name}] (Model: {selected_api_config.get('model')})")
-    
-    # 4. 初始化翻译器 (传入 selected_api_config)
+
+    # 4. 初始化翻译器
     settings = config.get('settings') if isinstance(config, dict) else None
     if not isinstance(settings, dict):
         raise ValueError("配置文件必须包含 settings 映射")
-    if not isinstance(selected_api_config, dict) or not all(selected_api_config.get(k) for k in ('api_key', 'base_url', 'model')):
-        raise ValueError(f"API 配置 [{api_name}] 必须包含 api_key、base_url 和 model")
+
+    # 端点轮询顺序：-a 指定的服务优先，其余按配置文件顺序依次作为后备。
+    api_order = [api_name] + [name for name in available_apis if name != api_name]
+    ordered_endpoints = []
+    for index, name in enumerate(api_order):
+        api_config = available_apis[name]
+        if not isinstance(api_config, dict) or not all(api_config.get(k) for k in ('api_key', 'base_url', 'model')):
+            message = f"API 配置 [{name}] 必须包含 api_key、base_url 和 model"
+            if index == 0:
+                raise ValueError(message)
+            print(f"[!] 警告：{message}，已跳过该服务")
+            continue
+        ordered_endpoints.append((name, api_config))
+    if len(ordered_endpoints) > 1:
+        print(f"[*] 服务轮询顺序: {' -> '.join(name for name, _ in ordered_endpoints)}")
 
     # 增强的配置验证
     for setting_name, minimum in (("thread_num", 1), ("batch_num", 1), ("timeout", 1)):
-        value = settings.get(setting_name, {"thread_num": 4, "batch_num": 40, "timeout": 30}[setting_name])
+        value = settings.get(setting_name, {"thread_num": 2, "batch_num": 10, "timeout": 45}[setting_name])
         if not isinstance(value, int) or value < minimum:
             raise ValueError(f"settings.{setting_name} 必须是大于等于 {minimum} 的整数")
 
     # 验证 temperature 范围
-    temperature = settings.get('temperature', 0.7)
+    temperature = settings.get('temperature', 0.3)
     if not isinstance(temperature, (int, float)) or not 0 <= temperature <= 2:
         raise ValueError("settings.temperature 必须是 0 到 2 之间的数值")
 
@@ -685,6 +941,11 @@ def main():
         raise ValueError("settings.merge_interval 必须是非负数值")
     if not isinstance(max_duration, (int, float)) or max_duration <= 0:
         raise ValueError("settings.max_duration 必须是正数值")
+
+    # 验证请求间隔（秒），0 表示不限速
+    request_interval = settings.get('request_interval', 1)
+    if isinstance(request_interval, bool) or not isinstance(request_interval, (int, float)) or request_interval < 0:
+        raise ValueError("settings.request_interval 必须是非负数值（0 表示不限速）")
 
     # 验证 replacements 中的正则表达式
     replacements = config.get('replacements', {})
@@ -701,19 +962,20 @@ def main():
                 del replacements[pattern]
 
     translator = LLMTranslator(
-        api_config=selected_api_config,
+        api_configs=ordered_endpoints,
         prompts=PROMPTS,
-        thread_num=settings.get('thread_num', 4),
-        batch_num=settings.get('batch_num', 40),
+        thread_num=settings.get('thread_num', 2),
+        batch_num=settings.get('batch_num', 10),
         source_lang=args.source,
         target_lang=args.lang,
         cache_dir=settings.get('cache_dir', './.cache_sub_trans'),
         temperature=temperature,
-        timeout=settings.get('timeout', 30)
+        timeout=settings.get('timeout', 45),
+        request_interval=request_interval
     )
 
     # 开始翻译：
-    print(f"[*] 任务开始: {args.source} -> {args.lang} | 并行数: {translator.thread_num} | 单批数量: {translator.batch_num} | 温度: {translator.temperature}")
+    print(f"[*] 任务开始: {args.source} -> {args.lang} | 并行数: {translator.thread_num} | 单批数量: {translator.batch_num} | 温度: {translator.temperature} | 请求间隔: {translator.request_interval}s")
     print("="*80)
     for i, srt_file in enumerate(srt_files, 1):
         # ... (循环内部逻辑保持不变)
