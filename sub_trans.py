@@ -6,6 +6,7 @@ import argparse
 import re
 import time
 import threading
+import unicodedata
 from datetime import timedelta
 import atexit
 import sys # 导入 sys 模块用于程序退出
@@ -53,10 +54,11 @@ BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『�
 
 # ###########失败标记#######################
 # 译文位置保留原文并加标记，便于人工定位补译。
-# 【原文】：模型未能正确翻译（漏翻、残留假名等）
+# 【未翻译】：模型未能正确翻译（漏翻、残留假名等），并保留原文便于定位
 # 【云端审查】：云端服务的内容审查拦截了该条字幕
 # 【翻译失败】：网络、超时或格式错误导致多次重试后仍失败
-UNTRANSLATED_MARK = "【{text}】"
+# Keep the original text visible while making the failure reason explicit.
+UNTRANSLATED_MARK = "【未翻译】{text}"
 CENSORED_MARK_PREFIX = "【云端审查】"
 FAILED_MARK_PREFIX = "【翻译失败】"
 CENSORED_MARK = CENSORED_MARK_PREFIX + "{text}"
@@ -91,6 +93,7 @@ class ASRData:
         self.merge_interval = 0.7
         self.max_duration = 8
         self.replace_dic = {}
+        self.translation_rejector: Optional[Callable[[str, Any], bool]] = None
 
     def clean_line(self, text: str) -> str:
         text = text.strip()
@@ -163,6 +166,9 @@ class ASRData:
                     segment.translated_text.startswith("【") and segment.translated_text.endswith("】"))
                 if not marked:
                     segment.translated_text = self.clean_line(segment.translated_text)
+                # Fast-mode exports must never restore source text after cleanup.
+                if self.translation_rejector and self.translation_rejector(segment.text, segment.translated_text):
+                    continue
                 # Empty translations fall back to the source so exports never lose dialogue.
                 if not segment.translated_text:
                     segment.translated_text = segment.text
@@ -394,8 +400,29 @@ class BaseTranslator(ABC):
         
         self.pbar.close()
 
+        retained_segments = []
+        fast_mode = getattr(self, "fast_mode", False)
+        asr_data.translation_rejector = self._should_drop_translation if fast_mode else None
         for seg in asr_data.segments:
-            seg.translated_text = translated_map.get(seg.index, "")
+            translated = translated_map.get(seg.index, "")
+            if fast_mode and hasattr(self, "_should_drop_translation") and self._should_drop_translation(seg.text, translated):
+                continue
+            # 缓存命中或旧版本缓存可能绕过 _translate_chunk 中的漏翻检测。
+            # 在写回字幕前再做一次统一检查，避免日文原文静默漏入输出。
+            if not translated:
+                translated = UNTRANSLATED_MARK.format(text=seg.text)
+                self.write(f"[!] 字幕 {seg.index} 标记为未翻译: {seg.text[:30]}...")
+            elif (not translated.startswith(MARK_PREFIXES)
+                    and hasattr(self, "_looks_untranslated")
+                    and self._looks_untranslated(seg.text, translated)):
+                translated = UNTRANSLATED_MARK.format(text=seg.text)
+                self.write(f"[!] 字幕 {seg.index} 标记为未翻译: {seg.text[:30]}...")
+            seg.translated_text = translated
+            retained_segments.append(seg)
+        removed = len(asr_data.segments) - len(retained_segments)
+        asr_data.segments = retained_segments
+        if fast_mode:
+            self.write(f"[*] 快速模式：保留 {len(retained_segments)} 条字幕，删除 {removed} 条无有效译文字幕")
         
         return asr_data
 
@@ -439,7 +466,7 @@ class BaseTranslator(ABC):
         cache_key = self._generate_chunk_cache_key(chunk)
 
         cached = self.cache.get(cache_key)
-        if cached:
+        if cached is not None:
             self.write(f"[*] 命中缓存: {cache_key}")
             return [SubtitleProcessData(**d) for d in cached]
 
@@ -525,13 +552,17 @@ class LLMTranslator(BaseTranslator):
 
     def __init__(self, api_configs: List[Tuple[str, dict]], prompts: dict, thread_num: int, batch_num: int,
                 source_lang: str, target_lang: str, cache_dir: str,
-                temperature: float = 0.6, timeout: int = 60, request_interval: float = 0.0):
+                temperature: float = 0.6, timeout: int = 60, request_interval: float = 0.0,
+                fast_mode: bool = True):
 
         if not api_configs:
             raise ValueError("至少需要一个 API 配置")
+        if not isinstance(fast_mode, bool):
+            raise ValueError("fast_mode 必须是布尔值")
         super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir, timeout, request_interval)
         self.prompts = prompts
         self.temperature = temperature
+        self.fast_mode = fast_mode
         # 每个端点独立持有 client / model / format，便于失败时整体切换。
         self.endpoints = [
             self._build_endpoint(name, cfg) for name, cfg in api_configs
@@ -581,8 +612,45 @@ class LLMTranslator(BaseTranslator):
     def _endpoint_label(self, index: int) -> str:
         return self.endpoints[index % len(self.endpoints)]["name"]
 
+    def _should_drop_translation(self, source: str, translation: Any) -> bool:
+        """Reject source fallbacks and residual Japanese in fast-mode output."""
+        if not isinstance(translation, str) or not translation.strip():
+            return True
+        if translation.startswith(("【未翻译】", CENSORED_MARK_PREFIX, FAILED_MARK_PREFIX)):
+            return True
+        if self.source_lang.strip().lower() in {"japanese", "日语", "日本語", "ja", "jp"} and \
+                self.target_lang.strip().lower() in {"简体中文", "繁体中文", "中文", "chinese", "zh", "zh-cn", "zh-tw"}:
+            normalized = unicodedata.normalize("NFKC", translation)
+            if re.search(r'[\u3040-\u30ff\u31f0-\u31ff\U0001b000-\U0001b16f]', normalized):
+                return True
+        return self._looks_untranslated(source, translation)
+
     def _translate_chunk_with_retry(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
         result = super()._translate_chunk_with_retry(chunk)
+        if self.fast_mode:
+            # Fast mode never retries a suspicious result: drop it from the
+            # returned chunk so it cannot reach the subtitle export path.
+            filtered = []
+            for item in result:
+                if self._should_drop_translation(item.original_text, item.translated_text):
+                    self.write(f"[!] 快速模式：跳过疑似漏翻字幕 {item.index}")
+                else:
+                    filtered.append(item)
+            result = filtered
+        # Cached responses were historically returned without the residual-language
+        # check in ``_translate_chunk``.  That allowed a previously cached Japanese
+        # copy to bypass retry/marking forever.  Invalidate such a cache entry once,
+        # then run the normal translation path so it can be retranslated and marked.
+        stale = [
+            item for item in result
+            if not self.fast_mode and not item.translated_text.startswith(MARK_PREFIXES)
+            and self._looks_untranslated(item.original_text, item.translated_text)
+        ]
+        if stale:
+            cache_key = self._generate_chunk_cache_key(chunk)
+            self.cache.delete(cache_key)
+            self.write(f"\n[!] 缓存中发现 {len(stale)} 条疑似未翻译字幕，已清除并重新翻译")
+            result = super()._translate_chunk_with_retry(chunk)
         # 成功完成一次请求后，让其他线程也优先使用这个可用端点。
         if not any(d.translated_text.startswith(FAILED_MARK_PREFIX) for d in result):
             self._set_preferred_endpoint(self._active_endpoint())
@@ -595,6 +663,7 @@ class LLMTranslator(BaseTranslator):
             "format": self.api_format,
             "temperature": self.temperature,
             "prompt": self._get_prompt("standard"),
+            "fast_mode": self.fast_mode,
         }
         return f"{super()._generate_chunk_cache_key(chunk)}:{generate_cache_key(context)}"
 
@@ -617,38 +686,46 @@ class LLMTranslator(BaseTranslator):
         try:
             result_dict = self._agent_loop(system_prompt, subtitle_dict)
             refused = {k for k, source in subtitle_dict.items()
-                       if self._looks_like_provider_refusal(result_dict[k]) and result_dict[k] != source}
+                       if isinstance(result_dict.get(k), str)
+                       and self._looks_like_provider_refusal(result_dict[k]) and result_dict[k] != source}
             for key in refused:
                 result_dict[key] = CENSORED_MARK.format(text=subtitle_dict[key])
             suspect = {k: source for k, source in subtitle_dict.items()
-                       if k not in refused and self._looks_untranslated(source, result_dict[k])}
+                       if k not in refused and (
+                           self._should_drop_translation(source, result_dict.get(k)) if self.fast_mode
+                           else self._looks_untranslated(source, result_dict.get(k)))}
             if suspect:
-                self.write(f"\n[-] 检出 {len(suspect)} 条疑似未翻译字幕 (chunk {chunk_range})，仅重译这些条目")
-                retry_dict = {}
-                try:
-                    retry_dict = self._agent_loop(
-                        system_prompt + "\nTranslate every supplied subtitle into " + self.target_lang +
-                        ". Do not copy the source text unless it is a proper name or intentional foreign dialogue.",
-                        suspect)
-                except FatalTranslationError:
-                    raise
-                except CensoredTranslationError:
-                    retry_dict = {key: CENSORED_MARK.format(text=source) for key, source in suspect.items()}
-                except Exception as e:
-                    self.write(f"\n[-] 疑似条目重译请求失败 (chunk {chunk_range}): {e}，将原文标记输出")
-                # 无论重译成功与否，都要处理疑似条目的标记
-                for key, source in suspect.items():
-                    candidate = retry_dict.get(key)
-                    if isinstance(candidate, str) and (candidate.startswith(CENSORED_MARK_PREFIX) or
-                            self._looks_like_provider_refusal(candidate)):
-                        result_dict[key] = CENSORED_MARK.format(text=source)
-                    elif candidate is not None and not self._looks_untranslated(source, candidate):
-                        result_dict[key] = candidate
-                    else:
-                        result_dict[key] = UNTRANSLATED_MARK.format(text=source)
-                        self.write(f"[!] 字幕 {key} 标记为未翻译: {source[:30]}...")
+                if self.fast_mode:
+                    for key in suspect:
+                        result_dict.pop(key, None)
+                        self.write(f"[!] 快速模式：跳过疑似漏翻字幕 {key}")
+                else:
+                    self.write(f"\n[-] 检出 {len(suspect)} 条疑似未翻译字幕 (chunk {chunk_range})，仅重译这些条目")
+                    retry_dict = {}
+                    try:
+                        retry_dict = self._agent_loop(
+                            system_prompt + "\nTranslate every supplied subtitle into " + self.target_lang +
+                            ". Do not copy the source text unless it is a proper name or intentional foreign dialogue.",
+                            suspect)
+                    except FatalTranslationError:
+                        raise
+                    except CensoredTranslationError:
+                        retry_dict = {key: CENSORED_MARK.format(text=source) for key, source in suspect.items()}
+                    except Exception as e:
+                        self.write(f"\n[-] 疑似条目重译请求失败 (chunk {chunk_range}): {e}，将原文标记输出")
+                    # 无论重译成功与否，都要处理疑似条目的标记
+                    for key, source in suspect.items():
+                        candidate = retry_dict.get(key)
+                        if isinstance(candidate, str) and (candidate.startswith(CENSORED_MARK_PREFIX) or
+                                self._looks_like_provider_refusal(candidate)):
+                            result_dict[key] = CENSORED_MARK.format(text=source)
+                        elif candidate is not None and not self._looks_untranslated(source, candidate):
+                            result_dict[key] = candidate
+                        else:
+                            result_dict[key] = UNTRANSLATED_MARK.format(text=source)
+                            self.write(f"[!] 字幕 {key} 标记为未翻译: {source[:30]}...")
             for d in chunk:
-                d.translated_text = result_dict[str(d.index)]
+                d.translated_text = result_dict.get(str(d.index), "")
             return chunk
         except (RateLimitError, APITimeoutError, TranslationError) as e:
             # 直接将这些错误向上抛出，由 _process_chunk_with_retry 处理
@@ -758,12 +835,29 @@ class LLMTranslator(BaseTranslator):
             trans_len = len(translation)
             # \u77ed\u5b57\u5e55\uff08<10\u5b57\u7b26\uff09\u63d0\u9ad8\u5047\u540d\u5360\u6bd4\u9608\u503c\uff0c\u907f\u514d\u8bef\u5224\u4eba\u540d\u3001\u53e3\u8bed
             threshold = 0.4 if trans_len < 10 else 0.2
-            if kana_count >= 2 and kana_count / max(trans_len, 1) >= threshold:
+            # A small kana fragment can be hidden inside an otherwise long Chinese
+            # sentence (for example ``这是テスト结果``), so an absolute signal is
+            # needed in addition to the ratio check.  Keep a single kana character
+            # exempt because names/interjections commonly remain intentionally.
+            if kana_count >= 2 and (kana_count / max(trans_len, 1) >= threshold
+                                    or re.search(r'[\u3040-\u30ff]{2,}', translation)):
                 return True
+            # A single kana can still be a leaked Japanese suffix in an
+            # otherwise Chinese sentence (for example ``你是谁だ``). Only flag
+            # it when it is adjacent to CJK text and the source itself contains
+            # Japanese kana, preserving isolated intentional foreign tokens.
+            if kana_count and re.search(r'[\u3400-\u9fff][\u3040-\u30ff]|'
+                                        r'[\u3040-\u30ff][\u3400-\u9fff]', translation):
+                if re.search(r'[\u3040-\u30ff]', source):
+                    return True
             # \u89c4\u8303\u5316\u6807\u70b9\uff1a\u79fb\u9664\u6807\u70b9\u548c\u7a7a\u683c\u540e\u6bd4\u8f83
             normalized_source = re.sub(r'[\s\u3000\u2000-\u206f\u3001-\u303f\uff00-\uffef!\uff01?\uff1f,.\uff0c\u3002\u3001;\uff1b:\uff1a\u2026\-\u2014]+', '', source)
             normalized_translation = re.sub(r'[\s\u3000\u2000-\u206f\u3001-\u303f\uff00-\uffef!\uff01?\uff1f,.\uff0c\u3002\u3001;\uff1b:\uff1a\u2026\-\u2014]+', '', translation)
-            if len(normalized_source) >= 4 and normalized_source == normalized_translation:
+            # Exact copies are untranslated even when the subtitle is a short
+            # two- or three-character Japanese word (e.g. "本気" or "大丈夫").
+            # The previous length>=4 guard let these common short lines bypass
+            # retry/marking entirely.
+            if len(normalized_source) >= 2 and normalized_source == normalized_translation:
                 return True
         return False
 
@@ -786,6 +880,9 @@ class LLMTranslator(BaseTranslator):
     def _validate_response(self, resp_dict: Any, origin_dict: Dict[str, str]) -> Tuple[bool, str]:
         if not isinstance(resp_dict, dict):
             return False, f"返回结果不是一个字典类型，而是 {type(resp_dict)}"
+
+        if self.fast_mode:
+            return True, ""
 
         origin_keys = set(origin_dict.keys())
         resp_keys = set(resp_dict.keys())
@@ -842,10 +939,13 @@ def main():
     parser.add_argument("-a", "--api", help="指定使用的 API 名称 (对应 config.yaml 中的 apis 键名)") # 新增参数
     parser.add_argument("--format", choices=['srt', 'ass'], default='srt', help="输出格式")
     parser.add_argument("--bilingual", action="store_true", help="输出双语对照")
+    parser.add_argument("--fast-mode", action=argparse.BooleanOptionalAction, default=None,
+                        help="快速模式：直接删除漏翻条目，不重译（默认开启；--no-fast-mode 关闭）")
     
     args = parser.parse_args()
-    # 获取翻译的提示词
-    PROMPTS = {k: v for k, v in vars(prompts).items() if not k.startswith("__")}
+    # 内置提示词作为兜底；配置文件加载后可覆盖它们。
+    PROMPTS = {k: v for k, v in vars(prompts).items()
+               if not k.startswith("_") and isinstance(v, str)}
 
     # 1. 获取 srt 文件列表
     srt_files = find_srt_files(args.input)
@@ -872,9 +972,11 @@ def main():
                 "temperature": 0.3,
                 "timeout": 45,
                 "request_interval": 1,
+                "fast_mode": True,
                 "merge_interval": 0.7,
                 "max_duration": 8
-            }
+            },
+            "prompt_file": "prompts.yaml"
         }
         with open(args.config, 'w', encoding='utf-8') as f:
             yaml.dump(default_config, f, allow_unicode=True)
@@ -884,6 +986,29 @@ def main():
         config = yaml.safe_load(f)
     if not isinstance(config, dict):
         raise ValueError("配置文件必须是 YAML 映射")
+
+    # 提示词可放在独立 YAML 文件中，路径相对 config.yaml 解析；
+    # 也支持直接在 config.yaml 的 prompts 映射中覆盖，内联配置优先。
+    # 未配置时默认查找 config.yaml 同目录的 prompts.yaml；设为 null 可禁用外置提示词。
+    prompt_file = config.get('prompt_file', 'prompts.yaml')
+    if prompt_file:
+        prompt_path = os.path.expanduser(str(prompt_file))
+        if not os.path.isabs(prompt_path):
+            prompt_path = os.path.join(os.path.dirname(os.path.abspath(args.config)), prompt_path)
+        try:
+            PROMPTS = prompts.load_prompt_file(prompt_path, PROMPTS)
+            print(f"[*] 已加载提示词文件: {prompt_path}")
+        except FileNotFoundError:
+            print(f"[!] 提示词文件不存在，使用内置提示词: {prompt_path}")
+        except (OSError, ValueError, yaml.YAMLError) as exc:
+            print(f"[!] 提示词文件加载失败，使用内置提示词: {exc}")
+    inline_prompts = config.get('prompts')
+    if isinstance(inline_prompts, dict):
+        inline_overrides = {str(key): value for key, value in inline_prompts.items()
+                            if isinstance(value, str)}
+        if inline_overrides:
+            PROMPTS.update(inline_overrides)
+            print(f"[*] 已应用配置内提示词: {', '.join(sorted(inline_overrides))}")
 
     # 3. 确定使用哪一个 API 配置
     available_apis = config.get('apis', {})
@@ -907,6 +1032,11 @@ def main():
     settings = config.get('settings') if isinstance(config, dict) else None
     if not isinstance(settings, dict):
         raise ValueError("配置文件必须包含 settings 映射")
+    fast_mode = settings.get('fast_mode', True)
+    if not isinstance(fast_mode, bool):
+        raise ValueError("settings.fast_mode 必须是布尔值（true 或 false）")
+    if args.fast_mode is not None:
+        fast_mode = args.fast_mode
 
     # 端点轮询顺序：-a 指定的服务优先，其余按配置文件顺序依次作为后备。
     api_order = [api_name] + [name for name in available_apis if name != api_name]
@@ -971,11 +1101,12 @@ def main():
         cache_dir=settings.get('cache_dir', './.cache_sub_trans'),
         temperature=temperature,
         timeout=settings.get('timeout', 45),
-        request_interval=request_interval
+        request_interval=request_interval,
+        fast_mode=fast_mode
     )
 
     # 开始翻译：
-    print(f"[*] 任务开始: {args.source} -> {args.lang} | 并行数: {translator.thread_num} | 单批数量: {translator.batch_num} | 温度: {translator.temperature} | 请求间隔: {translator.request_interval}s")
+    print(f"[*] 任务开始: {args.source} -> {args.lang} | 并行数: {translator.thread_num} | 单批数量: {translator.batch_num} | 温度: {translator.temperature} | 请求间隔: {translator.request_interval}s | 快速模式: {'开' if translator.fast_mode else '关'}")
     print("="*80)
     for i, srt_file in enumerate(srt_files, 1):
         # ... (循环内部逻辑保持不变)

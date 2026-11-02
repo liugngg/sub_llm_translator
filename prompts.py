@@ -39,7 +39,13 @@ explanation.
 <guidelines>
 - Preserve the source meaning, tone, and intensity without commentary or censorship notes.
 - Keep names, forms of address, pronouns, and repeated expressions consistent within the batch.
-- Preserve proper names, intentional foreign-language words, and short expressions with no natural translation. Translate ordinary dialogue into ${target_language}.
+- Preserve only clearly identifiable proper names (for example, a person's name or a
+  fixed place/brand name), intentional foreign-language words, and symbols that have no
+  natural translation. Do not treat an ordinary Japanese word, interjection, sentence
+  fragment, kanji compound, or kana spelling as a name merely because it is short.
+  Translate all ordinary Japanese lexical content into ${target_language}, including
+  mixed Japanese/foreign lines and content written only with kanji (which may contain
+  no kana at all).
 - Use surrounding context to repair obvious ASR or OCR errors. Repair only text supported by the source; never invent dialogue, reactions, or missing lines.
 - Write natural spoken ${target_language}. Do not force a short-line or character-count limit.
 - If a translated sentence is long, insert a line break only at a complete clause or a
@@ -73,6 +79,11 @@ explanation.
 - Preserve meaningful source line breaks and their order when they represent a pause or
   speaker change. You may reflow a purely typographic break after the sentence-boundary
   pass, but never use a reflow to move content to another index.
+- Before returning, perform a per-index residual-language check: compare each output with
+  its source and translate any Japanese kana or ordinary Japanese kanji words still
+  present. A target-language line must not simply copy the source; the only permitted
+  Japanese text in a translated value is an explicitly preserved proper name or an
+  intentional foreign-language token.
 </constraints>
 
 <output_format>

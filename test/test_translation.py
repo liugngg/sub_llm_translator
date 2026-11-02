@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sub_trans import (
+    ASRData,
+    ASRDataSeg,
     CensoredTranslationError,
     FatalTranslationError,
     LLMTranslator,
@@ -29,6 +31,7 @@ class TranslationWorkflowTests(unittest.TestCase):
             source_lang="Japanese",
             target_lang="简体中文",
             cache_dir=temp_dir.name,
+            fast_mode=False,
         )
         self.addCleanup(self.translator.cache.close)
         self.addCleanup(self.translator.client.close)
@@ -74,6 +77,7 @@ class TranslationWorkflowTests(unittest.TestCase):
                 self.translator._agent_loop("Return JSON", {"1": "a"})
 
     def test_partial_refusal_keeps_other_translations_without_retry(self):
+        self.translator.fast_mode = False
         chunk = [SubtitleProcessData(1, "こんにちは"), SubtitleProcessData(2, "さようなら")]
         with patch.object(self.translator, "_agent_loop", return_value={
             "1": "你好", "2": "I cannot translate this content."
@@ -82,7 +86,36 @@ class TranslationWorkflowTests(unittest.TestCase):
         self.assertEqual([d.translated_text for d in result], ["你好", "【云端审查】さようなら"])
         self.assertEqual(request.call_count, 1)
 
+    def test_residual_kana_in_long_translation_is_detected(self):
+        """A translated sentence must not silently retain a Japanese phrase."""
+        self.assertTrue(self.translator._looks_untranslated("これはテストです", "这是テスト结果"))
+        self.assertTrue(self.translator._looks_untranslated("誰ですか", "你是谁だ"))
+
+    def test_short_exact_copy_is_detected(self):
+        """Short Japanese lines are still suspicious when copied verbatim."""
+        self.assertTrue(self.translator._looks_untranslated("本気", "本気"))
+
+    def test_translate_marks_untranslated_result_before_export(self):
+        """The final write-back pass marks stale/cached untranslated responses."""
+        self.translator.fast_mode = False
+        source = ASRDataSeg("こんにちは", "00:00:00,000", "00:00:01,000", 1)
+        asr_data = ASRData([source])
+        returned = [SubtitleProcessData(1, "こんにちは", "こんにちは")]
+        with patch.object(self.translator, "_process_chunk_with_retry", return_value=returned):
+            self.translator.translate(asr_data)
+        self.assertEqual(source.translated_text, "【未翻译】こんにちは")
+
+    def test_fast_mode_drops_untranslated_entries(self):
+        self.translator.fast_mode = True
+        source = ASRDataSeg("こんにちは", "00:00:00,000", "00:00:01,000", 1)
+        data = ASRData([source])
+        returned = [SubtitleProcessData(1, "こんにちは", "こんにちは")]
+        with patch.object(self.translator, "_process_chunk_with_retry", return_value=returned):
+            self.translator.translate(data)
+        self.assertEqual(data.segments, [])
+
     def test_refused_retranslation_keeps_successful_entries(self):
+        self.translator.fast_mode = False
         chunk = [SubtitleProcessData(1, "こんにちは"), SubtitleProcessData(2, "さようなら")]
         with patch.object(self.translator, "_agent_loop", side_effect=[
             {"1": "你好", "2": "さようなら"}, CensoredTranslationError("blocked")
@@ -92,6 +125,7 @@ class TranslationWorkflowTests(unittest.TestCase):
         self.assertEqual(request.call_count, 2)
 
     def test_fatal_retranslation_error_propagates(self):
+        self.translator.fast_mode = False
         with patch.object(self.translator, "_agent_loop", side_effect=[
             {"1": "さようなら"}, FatalTranslationError("authentication failed")
         ]):
@@ -168,6 +202,7 @@ class RequestIntervalAndFailoverTests(unittest.TestCase):
             target_lang="简体中文",
             cache_dir=temp_dir.name,
             request_interval=request_interval,
+            fast_mode=False,
         )
         self.addCleanup(translator.cache.close)
         for endpoint in translator.endpoints:

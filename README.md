@@ -33,9 +33,11 @@ settings:
   temperature: 0.3
   timeout: 45
   request_interval: 1
+  fast_mode: true
   merge_interval: 0.7
   max_duration: 8
 replacements: {}
+prompt_file: "prompts.yaml"
 ```
 
 `base_url` 支持写服务根地址（程序自动补 `/v1`）或已经带 `/v1` 的地址。`format` 默认为 `chat_completions`，也可设为 `responses`。前者请求 `/chat/completions`，后者使用 SDK 的 `/responses` 接口。请确认服务提供商支持所选接口及 JSON 输出格式。例如 `https://host.example/api/v1` 会请求 `https://host.example/api/v1/chat/completions`。程序不会检测服务是否在线，也无法修复网络、DNS、代理或证书问题。
@@ -52,9 +54,13 @@ replacements: {}
 | `settings.temperature` | `0.3` | 模型采样温度；具体支持范围取决于服务。 |
 | `settings.timeout` | `45` | 单次 API 请求超时秒数，必须为正整数。 |
 | `settings.request_interval` | `1` | 相邻两次 API 请求的最小间隔（秒），必须为非负数，`0` 表示不限速。多线程共享同一条时间线，用于避免高并发触发限流。 |
+| `settings.fast_mode` | `true` | 快速翻译模式。检测到残留日语、疑似未翻译、空译文或失败/审查标记时，直接删除该字幕条目，不再二次重译。 |
 | `settings.merge_interval` | `0.7` | 合并相邻字幕的最大时间间隔（秒），必须为非负数。 |
 | `settings.max_duration` | `8` | 合并后字幕段允许的最大时长（秒），必须为正数。 |
 | `replacements` | `{}` | 翻译前的文本替换映射，键为原文，值为替换文本；支持项目已有的正则替换规则。启动时会检查正则表达式语法，无效的将被忽略并发出警告。 |
+| `prompt_file` | `prompts.yaml` | 外置提示词 YAML 文件路径；相对路径按 `config.yaml` 所在目录解析。文件缺失或无效时回退到内置提示词。 |
+
+提示词默认从 `config.yaml` 同目录的 `prompts.yaml` 读取（使用自定义 `-c` 时随配置文件移动）。修改其中的 `standard: |` 内容即可调整翻译规则，无需修改 Python 代码。也可以直接在 `config.yaml` 中加入 `prompts:` 映射覆盖提示词；内联配置优先于 `prompt_file`。
 
 **配置验证：** 程序启动时会验证配置的合法性。`temperature` 必须在 0-2 之间，`thread_num`、`batch_num`、`timeout` 必须为正整数，`merge_interval`、`max_duration`、`request_interval` 必须为有效数值。
 
@@ -76,13 +82,14 @@ python sub_trans.py -i <输入文件或目录> [选项]
 | `-a`, `--api` | 配置中的 `default_api` | 选择 `apis` 下的服务配置名称。 |
 | `--format` | `srt` | 输出格式，可选 `srt` 或 `ass`。显式指定 `--output` 为 `.ass` 文件时也会按扩展名输出 ASS。 |
 | `--bilingual` | 关闭 | 输出原文与译文双语字幕。 |
+| `--fast-mode` / `--no-fast-mode` | `--fast-mode` | 开关快速翻译模式；默认开启。关闭后恢复疑似漏翻条目的单独重译与标记流程。 |
 | `-h`, `--help` | — | 显示参数帮助并退出。 |
 
 ### 请求失败与审查处理
 
 - 网络、限流或格式错误最多尝试 3 次，两次重试前分别等待 1 秒、2 秒。SDK 自身也可能重试网络请求，因此 HTTP 请求数可能更多。
 - 配置了多个服务时，认证错误、模型不存在或整批审查拒绝会切换到下一个服务重新请求；所有服务均拒绝时才对半拆分批次隔离处理，单条仍被拒绝则输出 `【云端审查】原文`。JSON 内的明确拒绝说明只标记对应条目，保留其他译文。
-- 普通失败耗尽重试后输出 `【翻译失败】原文`，其他批次继续处理。所有服务均认证失败时终止当前文件；目录模式会继续尝试后续文件。
+- 普通失败耗尽重试后，快速模式会删除该字幕条目；关闭快速模式时输出 `【翻译失败】原文`，其他批次继续处理。所有服务均认证失败时终止当前文件；目录模式会继续尝试后续文件。
 - 内容审查处理不会保证云端服务接受内容；服务商的政策和模型行为仍然适用。
 - 以上默认值用于新生成配置及缺省字段，已有配置中明确设置的值保持有效。
 
@@ -91,7 +98,7 @@ python sub_trans.py -i <输入文件或目录> [选项]
 日译中时，程序会自动检测译文中疑似未翻译的内容：
 
 - **检测规则：** 译文中保留较多日文假名（平假名或片假名），或去除标点后与原文完全相同
-- **处理流程：** 检出疑似条目后单独重译一次；重译后仍未通过检查或请求失败时，该字幕译文会以 `【原文】` 格式标记输出
+- **处理流程：** 默认快速模式下，检出疑似条目后直接删除该字幕，不再发起二次翻译；使用 `--no-fast-mode` 或设置 `settings.fast_mode: false` 后，才会单独重译并在仍失败时输出 `【未翻译】原文`。
 - **优化措施：** 短字幕（<10 字符）使用更宽松的阈值，避免人名、口语被误判
 
 示例：
