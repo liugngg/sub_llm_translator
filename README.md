@@ -36,6 +36,7 @@ settings:
   fast_mode: true
   merge_interval: 0.7
   max_duration: 8
+  filter_non_semantic_vocalisation: true
 replacements: {}
 prompt_file: "prompts.yaml"
 ```
@@ -57,6 +58,7 @@ prompt_file: "prompts.yaml"
 | `settings.fast_mode` | `true` | 快速翻译模式。检测到残留日语、疑似未翻译、空译文或失败/审查标记时，直接删除该字幕条目，不再二次重译。 |
 | `settings.merge_interval` | `0.7` | 合并相邻字幕的最大时间间隔（秒），必须为非负数。 |
 | `settings.max_duration` | `8` | 合并后字幕段允许的最大时长（秒），必须为正数。 |
+| `settings.filter_non_semantic_vocalisation` | `true` | 翻译前删除仅由明确喘息、呻吟等非语义发声组成的 ASR 字幕。仅有 SRT 文本时不使用声学判断；包含可辨识词语或混合内容的字幕会保留。 |
 | `replacements` | `{}` | 翻译前的文本替换映射，键为原文，值为替换文本；支持项目已有的正则替换规则。启动时会检查正则表达式语法，无效的将被忽略并发出警告。 |
 | `prompt_file` | `prompts.yaml` | 外置提示词 YAML 文件路径；相对路径按 `config.yaml` 所在目录解析。文件缺失或无效时回退到内置提示词。 |
 

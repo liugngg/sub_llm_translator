@@ -10,6 +10,21 @@ def segment(index, text, start, end, translated=""):
 
 
 class SubtitleProcessingTests(unittest.TestCase):
+    def test_text_only_vocalisation_filter_drops_single_noise_and_keeps_dialogue(self):
+        data = ASRData([
+            segment(1, "はぁ…", "00:00:00,000", "00:00:01,000"),
+            segment(2, "うん", "00:00:01,100", "00:00:02,000"),
+            segment(3, "はぁ、好き", "00:00:02,100", "00:00:03,000"),
+            segment(4, "ちゅぷっ", "00:00:03,100", "00:00:04,000"),
+        ])
+
+        diagnostics = data.filter_non_semantic_vocalisation()
+
+        self.assertEqual(diagnostics["vocalisation_cues_scanned"], 4)
+        self.assertEqual(diagnostics["vocalisation_cues_dropped"], 2)
+        self.assertEqual([seg.text for seg in data.segments], ["うん", "はぁ、好き"])
+        self.assertEqual([seg.index for seg in data.segments], [1, 2])
+
     def test_parse_utf8_japanese_srt_and_clean_lines(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "japanese.srt"

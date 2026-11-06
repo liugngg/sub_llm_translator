@@ -50,6 +50,81 @@ REPEAT_CONTENT_RE = re.compile(r'(.{2,}?)([\s,.!?;，。！？；]*)\1+', flags=
 
 # 如果一行完全由语气词（呃 / 诶 / 啊…，但‘嗯’则保留）或标点组成，则替换为空
 BLANK_RE = re.compile(r'^[ ,.，。！、!?？：；;—\-\–…\"''~「」『』噢啊嗬嗯哈唔哎呼咿呜呀西咻昂呐恩库莫伊阿咕哒喽呗嘛哟哇呃哦啦唉欸诶喔哼嘿喂干燥咚哔]*$', flags=re.UNICODE|re.MULTILINE)
+
+# Text-only pre-translation filter for ASR subtitles.  These are deliberately
+# allow-listed vocalisation units: a broad kana regex would delete ordinary
+# Japanese words that happen to use the same characters.
+VOCALISATION_DECORATION = set("、。！？!?…‥・「」『』（）()♪ .,-~\"'`;:")
+VOCALISATION_CORE_CHARS = set(
+    "あぁいぃうぅえぇおぉっんはひふへほ"
+    "アァイィウゥエェオォッンハヒフヘホー〜～"
+)
+VOCALISATION_MORPHEMES = tuple(sorted(
+    (
+        "ちゅぱ", "ちゅる", "ちゅぷ", "ぐちゅ", "ぴちゃ", "じゅる", "ぬぷ",
+        "ちゅ", "れろ", "ぺろ", "んぐ", "んむ", "ずず", "じゅ",
+    ),
+    key=len,
+    reverse=True,
+))
+# Short words whose spelling overlaps with breath/moan syllables.
+VOCALISATION_PROTECTED = frozenset({
+    "うん", "ううん", "うんうん", "うんっ", "うーん", "ううーん",
+    "はい", "はいはい", "はーい", "いいえ", "いえ", "ええ", "えー", "えっ", "え",
+    "ええと", "えっと", "えーと", "うーんと", "いい", "いいー", "おい", "おーい", "おう",
+    "ふーん", "ふうん", "へぇ", "へえ", "ふふ", "ふふっ", "ふふふ", "へへ", "へへっ",
+    "ほほ", "はは", "ははっ", "あはは", "うふふ", "えへへ",
+})
+
+
+def _vocalisation_parts(text: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    for char in str(text or ""):
+        if char in VOCALISATION_DECORATION or char.isspace():
+            if current:
+                parts.append("".join(current))
+                current = []
+        else:
+            current.append(char)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def _vocalisation_decomposes(body: str) -> bool:
+    index = 0
+    while index < len(body):
+        for morpheme in VOCALISATION_MORPHEMES:
+            if body.startswith(morpheme, index):
+                index += len(morpheme)
+                break
+        else:
+            if body[index] not in VOCALISATION_CORE_CHARS:
+                return False
+            index += 1
+    return True
+
+
+def is_non_semantic_vocalisation(text: str) -> bool:
+    """Return True only for a whole cue that is recognisable vocal noise.
+
+    This intentionally has no acoustic claim: an SRT contains only ASR text.
+    Mixed cues and ambiguous short utterances are kept; the caller may safely
+    remove a single cue only when this function returns True.
+    """
+    parts = _vocalisation_parts(text)
+    body = "".join(parts)
+    if not body or body in VOCALISATION_PROTECTED:
+        return False
+    if any(part in VOCALISATION_PROTECTED for part in parts):
+        return False
+    # Any kanji, Latin text, or digit is a lexical signal.  The decomposition
+    # below handles kana-only noise without treating every kana as noise.
+    if any(char.isdigit() or (char.isascii() and char.isalpha()) or "CJK UNIFIED" in unicodedata.name(char, "")
+           for char in body):
+        return False
+    return _vocalisation_decomposes(body)
 ###############################################################
 
 # ###########失败标记#######################
@@ -94,6 +169,25 @@ class ASRData:
         self.max_duration = 8
         self.replace_dic = {}
         self.translation_rejector: Optional[Callable[[str, Any], bool]] = None
+
+    def filter_non_semantic_vocalisation(self) -> Dict[str, int]:
+        """Drop unambiguously non-semantic ASR vocalisation before translation.
+
+        SRT input has no audio features, so this is deliberately text-only. A
+        cue is removed only when its entire text decomposes into the explicit
+        vocalisation allow-list; recognizable words and mixed cues remain.
+        """
+        before = len(self.segments)
+        kept = [segment for segment in self.segments
+                if not is_non_semantic_vocalisation(segment.text)]
+        self.segments = kept
+        for index, segment in enumerate(self.segments, 1):
+            segment.index = index
+        return {
+            "vocalisation_cues_scanned": before,
+            "vocalisation_cues_dropped": before - len(kept),
+            "vocalisation_acoustics_available": 0,
+        }
 
     def clean_line(self, text: str) -> str:
         text = text.strip()
@@ -974,7 +1068,8 @@ def main():
                 "request_interval": 1,
                 "fast_mode": True,
                 "merge_interval": 0.7,
-                "max_duration": 8
+                "max_duration": 8,
+                "filter_non_semantic_vocalisation": True
             },
             "prompt_file": "prompts.yaml"
         }
@@ -1118,6 +1213,11 @@ def main():
             asr_data.merge_interval = settings.get('merge_interval', 0.7)
             asr_data.max_duration = settings.get('max_duration', 8)
             asr_data.replace_dic = config.get('replacements', {})
+            if settings.get('filter_non_semantic_vocalisation', True):
+                vocalisation_diagnostics = asr_data.filter_non_semantic_vocalisation()
+                dropped = vocalisation_diagnostics['vocalisation_cues_dropped']
+                if dropped:
+                    translator.write(f"[*] 已过滤 {dropped} 条纯非语义人声字幕（仅依据 ASR 文本）")
             asr_data.srt_clean()
             asr_data.srt_merge()
             asr_data.srt_clean()            
