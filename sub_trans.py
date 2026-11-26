@@ -647,16 +647,19 @@ class LLMTranslator(BaseTranslator):
     def __init__(self, api_configs: List[Tuple[str, dict]], prompts: dict, thread_num: int, batch_num: int,
                 source_lang: str, target_lang: str, cache_dir: str,
                 temperature: float = 0.6, timeout: int = 60, request_interval: float = 0.0,
-                fast_mode: bool = True):
+                fast_mode: bool = True, fast_mode_retry_threshold: int = 3):
 
         if not api_configs:
             raise ValueError("至少需要一个 API 配置")
         if not isinstance(fast_mode, bool):
             raise ValueError("fast_mode 必须是布尔值")
+        if not isinstance(fast_mode_retry_threshold, int) or fast_mode_retry_threshold < 1:
+            raise ValueError("fast_mode_retry_threshold 必须是正整数")
         super().__init__(thread_num, batch_num, source_lang, target_lang, cache_dir, timeout, request_interval)
         self.prompts = prompts
         self.temperature = temperature
         self.fast_mode = fast_mode
+        self.fast_mode_retry_threshold = fast_mode_retry_threshold
         # 每个端点独立持有 client / model / format，便于失败时整体切换。
         self.endpoints = [
             self._build_endpoint(name, cfg) for name, cfg in api_configs
@@ -722,15 +725,38 @@ class LLMTranslator(BaseTranslator):
     def _translate_chunk_with_retry(self, chunk: List[SubtitleProcessData]) -> List[SubtitleProcessData]:
         result = super()._translate_chunk_with_retry(chunk)
         if self.fast_mode:
-            # Fast mode never retries a suspicious result: drop it from the
-            # returned chunk so it cannot reach the subtitle export path.
+            # Fast mode: check dropped count and retry entire chunk if threshold exceeded
+            dropped = []
             filtered = []
             for item in result:
                 if self._should_drop_translation(item.original_text, item.translated_text):
-                    self.write(f"[!] 快速模式：跳过疑似漏翻字幕 {item.index}")
+                    dropped.append(item)
                 else:
                     filtered.append(item)
-            result = filtered
+
+            # If dropped count exceeds threshold, retry the entire chunk once
+            if len(dropped) > self.fast_mode_retry_threshold:
+                self.write(f"\n[!] 快速模式：批次漏翻 {len(dropped)} 条，超过阈值 {self.fast_mode_retry_threshold}，重译整批")
+                # Clear cache to force fresh translation
+                cache_key = self._generate_chunk_cache_key(chunk)
+                self.cache.delete(cache_key)
+                # Retry with the parent implementation (without fast mode filtering)
+                result = super()._translate_chunk_with_retry(chunk)
+                # Reapply filtering after retry
+                dropped = []
+                filtered = []
+                for item in result:
+                    if self._should_drop_translation(item.original_text, item.translated_text):
+                        dropped.append(item)
+                        self.write(f"[!] 快速模式：重译后仍跳过疑似漏翻字幕 {item.index}")
+                    else:
+                        filtered.append(item)
+                result = filtered
+            else:
+                # Below threshold: just log dropped items
+                for item in dropped:
+                    self.write(f"[!] 快速模式：跳过疑似漏翻字幕 {item.index}")
+                result = filtered
         # Cached responses were historically returned without the residual-language
         # check in ``_translate_chunk``.  That allowed a previously cached Japanese
         # copy to bypass retry/marking forever.  Invalidate such a cache entry once,
@@ -1000,8 +1026,92 @@ class LLMTranslator(BaseTranslator):
         return True, ""
 
 # ==========================================
-# 4. CLI 主程序 (保持原有逻辑，优化交互)
+# 4. CLI 主程序 (保持原有逻辑,优化交互)
 # ==========================================
+
+def select_api_with_timeout(available_apis: Dict[str, dict], default_api: str, timeout_seconds: int = 3) -> str:
+    """
+    列出可用的 API 并让用户选择，带超时自动选择默认值。
+
+    Args:
+        available_apis: 可用的 API 配置字典
+        default_api: 默认 API 名称
+        timeout_seconds: 超时秒数，默认 3 秒
+
+    Returns:
+        选择的 API 名称
+    """
+    import select
+
+    api_list = list(available_apis.keys())
+    if default_api not in api_list and api_list:
+        default_api = api_list[0]
+
+    print("\n" + "="*80)
+    print("[*] 检测到以下可用的 LLM API 配置:")
+    print("="*80)
+    for idx, (name, cfg) in enumerate(available_apis.items(), 1):
+        model = cfg.get('model', 'unknown')
+        base_url = cfg.get('base_url', '')
+        is_default = " [默认]" if name == default_api else ""
+        print(f"  {idx}. {name:15s} | Model: {model:30s} | URL: {base_url}{is_default}")
+    print("="*80)
+
+    default_idx = api_list.index(default_api) + 1 if default_api in api_list else 1
+
+    # Windows 不支持 select.select() 用于 stdin，使用线程实现超时
+    if sys.platform == 'win32':
+        import threading
+
+        result = [None]
+
+        def get_input():
+            try:
+                result[0] = input(f"请选择 API (1-{len(api_list)}) [默认: {default_idx}，{timeout_seconds}秒后自动选择]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                result[0] = ""
+
+        input_thread = threading.Thread(target=get_input, daemon=True)
+        input_thread.start()
+        input_thread.join(timeout=timeout_seconds)
+
+        user_input = result[0]
+        if user_input is None:
+            print(f"\n[*] {timeout_seconds}秒内未响应，自动选择默认配置: {default_api}")
+            return default_api
+    else:
+        # Unix-like 系统使用 select
+        print(f"请选择 API (1-{len(api_list)}) [默认: {default_idx}，{timeout_seconds}秒后自动选择]: ", end='', flush=True)
+        ready, _, _ = select.select([sys.stdin], [], [], timeout_seconds)
+
+        if not ready:
+            print(f"\n[*] {timeout_seconds}秒内未响应，自动选择默认配置: {default_api}")
+            return default_api
+
+        user_input = sys.stdin.readline().strip()
+
+    # 处理用户输入
+    if not user_input:
+        print(f"[*] 使用默认配置: {default_api}")
+        return default_api
+
+    try:
+        choice = int(user_input)
+        if 1 <= choice <= len(api_list):
+            selected = api_list[choice - 1]
+            print(f"[*] 已选择: {selected}")
+            return selected
+        else:
+            print(f"[!] 输入超出范围，使用默认配置: {default_api}")
+            return default_api
+    except ValueError:
+        # 尝试按名称匹配
+        if user_input in api_list:
+            print(f"[*] 已选择: {user_input}")
+            return user_input
+        else:
+            print(f"[!] 无效输入，使用默认配置: {default_api}")
+            return default_api
 
 def main():
     def find_srt_files(input_path: str) -> List[str]:
@@ -1067,6 +1177,8 @@ def main():
                 "timeout": 45,
                 "request_interval": 1,
                 "fast_mode": True,
+                "fast_mode_retry_threshold": 3,
+                "api_selection_timeout": 3,
                 "merge_interval": 0.7,
                 "max_duration": 8,
                 "filter_non_semantic_vocalisation": True
@@ -1110,18 +1222,32 @@ def main():
     if not available_apis:
         print("[-] 错误：配置文件中没有找到 'apis' 配置项。")
         sys.exit(1)
-    # 优先级：命令行参数 > 配置文件中的 default_api > 第一个可用的 API
-    api_name = args.api or config.get('default_api')
-    if not api_name or api_name not in available_apis:
-        if args.api:
+
+    # 确定默认 API
+    default_api = config.get('default_api') or list(available_apis.keys())[0]
+
+    # 优先级：命令行参数 > 交互选择 > 配置文件中的 default_api
+    if args.api:
+        # 命令行指定了 API
+        if args.api not in available_apis:
             print(f"[-] 错误：指定的 API '{args.api}' 不在配置文件中。")
             print(f"[*] 可用的 API 有: {', '.join(available_apis.keys())}")
             sys.exit(1)
-        else:
-            api_name = list(available_apis.keys())[0]
-            print(f"[*] 未指定 API 且无默认设置，自动选择第一个: {api_name}")
+        api_name = args.api
+        print(f"[*] 命令行指定 API 配置: [{api_name}]")
+    else:
+        # 未指定 API，获取交互超时配置（默认 3 秒）
+        settings = config.get('settings', {})
+        api_selection_timeout = settings.get('api_selection_timeout', 3)
+        if not isinstance(api_selection_timeout, (int, float)) or api_selection_timeout < 0:
+            api_selection_timeout = 3
+
+        # 交互式选择 API
+        api_name = select_api_with_timeout(available_apis, default_api, int(api_selection_timeout))
+
     selected_api_config = available_apis[api_name]
     print(f"[*] 已选择 API 配置: [{api_name}] (Model: {selected_api_config.get('model')})")
+
 
     # 4. 初始化翻译器
     settings = config.get('settings') if isinstance(config, dict) else None
@@ -1172,6 +1298,11 @@ def main():
     if isinstance(request_interval, bool) or not isinstance(request_interval, (int, float)) or request_interval < 0:
         raise ValueError("settings.request_interval 必须是非负数值（0 表示不限速）")
 
+    # 验证快速模式批次重译阈值
+    fast_mode_retry_threshold = settings.get('fast_mode_retry_threshold', 3)
+    if not isinstance(fast_mode_retry_threshold, int) or fast_mode_retry_threshold < 1:
+        raise ValueError("settings.fast_mode_retry_threshold 必须是正整数")
+
     # 验证 replacements 中的正则表达式
     replacements = config.get('replacements', {})
     if replacements and isinstance(replacements, dict):
@@ -1197,11 +1328,14 @@ def main():
         temperature=temperature,
         timeout=settings.get('timeout', 45),
         request_interval=request_interval,
-        fast_mode=fast_mode
+        fast_mode=fast_mode,
+        fast_mode_retry_threshold=fast_mode_retry_threshold
     )
 
     # 开始翻译：
     print(f"[*] 任务开始: {args.source} -> {args.lang} | 并行数: {translator.thread_num} | 单批数量: {translator.batch_num} | 温度: {translator.temperature} | 请求间隔: {translator.request_interval}s | 快速模式: {'开' if translator.fast_mode else '关'}")
+    if translator.fast_mode:
+        print(f"[*] 快速模式批次重译阈值: {translator.fast_mode_retry_threshold} 条")
     print("="*80)
     for i, srt_file in enumerate(srt_files, 1):
         # ... (循环内部逻辑保持不变)
